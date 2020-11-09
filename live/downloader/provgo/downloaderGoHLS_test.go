@@ -3,8 +3,8 @@ package provgo
 import (
 	"crypto/tls"
 	"github.com/fzxiao233/Vtb_Record/config"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/stealth"
 	"github.com/fzxiao233/Vtb_Record/live/interfaces"
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader/stealth"
 	log "github.com/sirupsen/logrus"
 	"net/http"
 	"testing"

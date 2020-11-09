@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/fzxiao233/Vtb_Record/config"
+	"github.com/fzxiao233/Vtb_Record/live/downloader"
 	"github.com/fzxiao233/Vtb_Record/live/interfaces"
 	"github.com/fzxiao233/Vtb_Record/live/monitor"
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader"
 	"github.com/fzxiao233/Vtb_Record/utils"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
@@ -16,6 +16,12 @@ import (
 	"strings"
 	"time"
 )
+
+type PluginInterface interface {
+	OnLiveStart(p *ProcessVideo)
+	OnDownloadStart(p *ProcessVideo)
+	OnLiveEnd(p *ProcessVideo)
+}
 
 type VideoPathList []string
 type LiveTitleHistoryEntry struct {
@@ -29,7 +35,8 @@ type ProcessVideo struct {
 	videoPathList VideoPathList
 	LiveTrace     monitor.LiveTrace
 	Monitor       monitor.VideoMonitor
-	Plugins       PluginManager
+	Plugins       PluginInterface
+	Stopped       bool
 	needStop      bool
 	triggerChan   chan int
 	finish        chan int
@@ -41,7 +48,7 @@ func init() {
 	limit = rate.NewLimiter(rate.Every(time.Second*5), 1)
 }
 
-func StartProcessVideo(LiveTrace monitor.LiveTrace, Monitor monitor.VideoMonitor, Plugins PluginManager) *ProcessVideo {
+func StartProcessVideo(LiveTrace monitor.LiveTrace, Monitor monitor.VideoMonitor, Plugins PluginInterface) *ProcessVideo {
 	p := &ProcessVideo{LiveTrace: LiveTrace, Monitor: Monitor, Plugins: Plugins}
 	liveStatus := LiveTrace(Monitor)
 	if liveStatus.IsLive {
@@ -53,12 +60,13 @@ func StartProcessVideo(LiveTrace monitor.LiveTrace, Monitor monitor.VideoMonitor
 	return p
 }
 
-func (p *ProcessVideo) getLogger() *log.Entry {
+func (p *ProcessVideo) GetLogger() *log.Entry {
 	return log.WithField("video", p.LiveStatus.Video)
 }
 
 func (p *ProcessVideo) StartProcessVideo() {
-	p.getLogger().Infof("is living. start to process")
+	p.GetLogger().Infof("is living. start to process")
+	p.Stopped = false
 	p.needStop = false //  默认在直播中
 	p.liveStartTime = time.Now()
 	p.finish = make(chan int)
@@ -68,7 +76,7 @@ func (p *ProcessVideo) StartProcessVideo() {
 	go p.keepLiveAlive()
 	if p.isNeedDownload() {
 		if err := p.prepareDownload(); err != nil {
-			p.getLogger().WithError(err).Warnf("Failed to prepare download")
+			p.GetLogger().WithError(err).Warnf("Failed to prepare download")
 			p.finish <- -1
 		} else {
 			go p.Plugins.OnDownloadStart(p)
@@ -76,6 +84,8 @@ func (p *ProcessVideo) StartProcessVideo() {
 		}
 	}
 	<-p.finish
+	close(p.finish)
+	p.Stopped = true
 	p.Plugins.OnLiveEnd(p)
 }
 
@@ -89,7 +99,7 @@ func (p *ProcessVideo) prepareDownload() error {
 	}
 	dirpath := strings.Join(pathSlice, "/")
 	ret, err := utils.MakeDir(dirpath)
-	p.getLogger().Debugf("Made directory: %s, ret: %s, err: %s", dirpath, ret, err)
+	p.GetLogger().Debugf("Made directory: %s, ret: %s, err: %s", dirpath, ret, err)
 	if err != nil {
 		return err
 	}
@@ -99,7 +109,7 @@ func (p *ProcessVideo) prepareDownload() error {
 }
 
 func (p *ProcessVideo) startDownloadVideo() {
-	logger := p.getLogger()
+	logger := p.GetLogger()
 	dirpath := p.LiveStatus.Video.UsersConfig.DownloadDir
 
 	func() {
@@ -189,7 +199,7 @@ func (p *ProcessVideo) isNeedDownload() bool {
 }
 
 func (p *ProcessVideo) keepLiveAlive() {
-	logger := p.getLogger()
+	logger := p.GetLogger()
 	ticker := time.NewTicker(time.Second * time.Duration(config.Config.NormalCheckSec*3))
 	defer ticker.Stop()
 	for {
@@ -220,7 +230,7 @@ func (p *ProcessVideo) appendTitleHistory(title string) {
 
 func (p *ProcessVideo) isNewLive() bool {
 	newLiveStatus := p.LiveTrace(p.Monitor)
-	logger := p.getLogger()
+	logger := p.GetLogger()
 	if newLiveStatus.IsLive == false || p.LiveStatus.IsLive == false {
 		logger.Infof("[isNewLive] live offline")
 		return true
@@ -245,7 +255,7 @@ func (p *ProcessVideo) getFullTitle() string {
 			Title:     p.LiveStatus.Video.Title,
 			StartTime: p.liveStartTime,
 		})
-		p.getLogger().Warnf("no TitleHistory!")
+		p.GetLogger().Warnf("no TitleHistory!")
 	}
 
 	for _, titleHistory := range p.TitleHistory {

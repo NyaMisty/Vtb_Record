@@ -14,19 +14,32 @@ import (
 	"runtime"
 )
 
+type LogWrapHook struct {
+	Enabled  bool
+	Hook     logrus.Hook
+	LogLevel logrus.Level
+}
+
+func (h *LogWrapHook) Levels() []logrus.Level {
+	return logrus.AllLevels[:logrus.DebugLevel+1]
+}
+
+func (h *LogWrapHook) Fire(entry *logrus.Entry) error {
+	if !h.Enabled || entry.Level > h.LogLevel {
+		return nil
+	}
+	return h.Hook.Fire(entry)
+}
+
 // WriterHook is a hook that writes logs of specified LogLevels to specified Writer
 type WriterHook struct {
 	Out       io.Writer
 	Formatter logrus.Formatter
-	LogLevel  logrus.Level
 }
 
 // Fire will be called when some logging function is called with current hook
 // It will format logrus entry to string and write it to appropriate writer
 func (hook *WriterHook) Fire(entry *logrus.Entry) error {
-	if entry.Level > hook.LogLevel {
-		return nil
-	}
 	serialized, err := hook.Formatter.Format(entry)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to obtain reader, %v\n", err)
@@ -44,9 +57,9 @@ func (hook *WriterHook) Levels() []logrus.Level {
 	return logrus.AllLevels[:logrus.DebugLevel+1]
 }
 
-var ConsoleHook *WriterHook
-var FileHook *lumberjackrus.Hook
-var GoogleHook *sdhook.StackdriverHook
+var ConsoleHook *LogWrapHook
+var FileHook *LogWrapHook
+var GoogleHook *LogWrapHook
 
 // Can't be func init as we need the parsed config
 func InitLog() {
@@ -66,15 +79,18 @@ func InitLog() {
 	}
 	logrus.SetFormatter(formatter)
 
-	ConsoleHook = &WriterHook{ // Send logs with level higher than warning to stderr
-		Out:       logrus.StandardLogger().Out,
-		Formatter: formatter,
-		LogLevel:  logrus.InfoLevel,
+	ConsoleHook = &LogWrapHook{
+		Enabled:  true,
+		LogLevel: logrus.InfoLevel,
+		Hook: &WriterHook{ // Send logs with level higher than warning to stderr
+			Out:       logrus.StandardLogger().Out,
+			Formatter: formatter,
+		},
 	}
 	logrus.AddHook(ConsoleHook)
 	logrus.StandardLogger().Out = ioutil.Discard
 
-	FileHook, err = lumberjackrus.NewHook(
+	fileHook, err := lumberjackrus.NewHook(
 		&lumberjackrus.LogFile{
 			Filename:   Config.LogFile,
 			MaxSize:    Config.LogFileSize,
@@ -87,14 +103,19 @@ func InitLog() {
 		&logrus.JSONFormatter{},
 		nil,
 	)
-
 	if err != nil {
 		panic(fmt.Errorf("NewHook Error: %s", err))
 	}
 
+	FileHook = &LogWrapHook{
+		Enabled:  true,
+		Hook:     fileHook,
+		LogLevel: logrus.DebugLevel,
+	}
+
 	logrus.AddHook(FileHook)
 
-	GoogleHook, err = sdhook.New(
+	googleHook, err := sdhook.New(
 		sdhook.GoogleLoggingAgent(),
 		sdhook.LogName(Config.LogFile),
 		sdhook.Levels(logrus.AllLevels[:logrus.DebugLevel+1]...),
@@ -102,6 +123,11 @@ func InitLog() {
 	if err != nil {
 		logrus.WithField("prof", true).Warnf("Failed to initialize the sdhook: %v", err)
 	} else {
+		GoogleHook = &LogWrapHook{
+			Enabled:  true,
+			Hook:     googleHook,
+			LogLevel: logrus.DebugLevel,
+		}
 		logrus.AddHook(GoogleHook)
 	}
 

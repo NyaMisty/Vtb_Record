@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	m3u8Parser "github.com/etherlabsio/go-m3u8/m3u8"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/stealth"
 	"github.com/fzxiao233/Vtb_Record/live/interfaces"
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader/stealth"
 	"github.com/fzxiao233/Vtb_Record/utils"
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/patrickmn/go-cache"
@@ -33,12 +33,13 @@ type HLSSegment struct {
 }
 
 type HLSDownloader struct {
-	Logger          *log.Entry
-	M3U8UrlRewriter stealth.URLRewriter
-	AltAsMain       bool
-	OutPath         string
-	Video           *interfaces.VideoInfo
-	Cookie          string
+	Logger             *log.Entry
+	M3U8UrlRewriter    stealth.URLRewriter
+	GeneralUrlRewriter stealth.URLRewriter
+	AltAsMain          bool
+	OutPath            string
+	Video              *interfaces.VideoInfo
+	Cookie             string
 
 	HLSUrl         string
 	HLSHeader      map[string]string
@@ -46,10 +47,12 @@ type HLSDownloader struct {
 	AltHLSHeader   map[string]string
 	UrlUpdating    sync.Mutex
 	AltUrlUpdating sync.Mutex
+	altFallback    bool
 
 	Clients    []*http.Client
 	AltClients []*http.Client
 	allClients []*http.Client
+	clientsMap map[*http.Client]string
 
 	SeqMap     sync.Map
 	AltSeqMap  *lru.Cache
@@ -100,9 +103,13 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 	}()
 	doDownload := func(client *http.Client) {
 		s := time.Now()
+		clientType, ok := d.clientsMap[client]
+		if !ok {
+			clientType = "unknown"
+		}
 		newbuf, err := utils.HttpGetBuffer(client, segData.Url, d.HLSHeader, nil)
 		if err != nil {
-			logger.WithError(err).Infof("Err when download segment %s", segData.Url)
+			logger.WithError(err).Infof("Err when download segment %s with %s client", segData.Url, clientType)
 			// if it's 404, then we'll never be able to download it later, stop the useless retry
 			if strings.HasSuffix(err.Error(), "404") {
 				func() {
@@ -120,7 +127,7 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 			usedTime := time.Now().Sub(s)
 			if usedTime > time.Second*15 {
 				// we used too much time to download a segment
-				logger.Infof("Download %d used %s", segData.SegNo, usedTime)
+				logger.Infof("Download %d used %s with %s client", segData.SegNo, usedTime, clientType)
 			}
 			func() {
 				defer func() {
@@ -149,21 +156,11 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 			clients = d.allClients
 		}
 	} else {
-		// TODO: Refactor this
-		if strings.Contains(segData.Url, "gotcha105") {
-			clients = make([]*http.Client, 0)
-			clients = append(clients, d.Clients...)
-			clients = append(clients, d.Clients...) // double same client
-		} else if strings.Contains(segData.Url, "gotcha104") {
-			clients = []*http.Client{}
-			clients = append(clients, d.AltClients...)
-			clients = append(clients, d.Clients...)
-		} else if strings.Contains(segData.Url, "googlevideo.com") {
-			clients = []*http.Client{}
-			clients = append(clients, d.Clients...)
-		}
+		//segData.Url =  d.GeneralUrlRewriter.Rewrite(segData.Url)
+		useMain, useAlt := stealth.GetAltProxyRuleForUrl(segData.Url)
+		clients = d.GetClients(useMain, useAlt, true)
+		logger.Tracef("Downloading segment %d (%s) useMain %d useAlt %d", segData.SegNo, segData.Url, useMain, useAlt)
 	}
-
 	// we one by one use each clients to download the segment, the first returned downloader wins
 	// normally each hls seg will exist for 1 minutes
 	round := 0
@@ -184,7 +181,7 @@ breakout:
 			// wait 10 second for each download try
 		}
 		if i == len(clients) {
-			logger.Warnf("Failed all-clients to download segment %d", segData.SegNo)
+			logger.Warnf("Failed all-clients to download segment %d (%s)", segData.SegNo, segData.Url)
 			round++
 		}
 		if time.Now().Sub(segData.SegArriveTime) > 300*time.Second {
@@ -194,9 +191,9 @@ breakout:
 	}
 	if round > 0 {
 		// log the too long seg download and alt seg download
-		logger.Infof("Downloaded segment %d: len %v", segData.SegNo, segData.Data.Len())
+		logger.Infof("Downloaded segment %d (%s): len %v client %d", segData.SegNo, segData.Url, segData.Data.Len(), i)
 	} else {
-		logger.Debugf("Downloaded segment %d: len %v", segData.SegNo, segData.Data.Len())
+		logger.Tracef("Downloaded segment %d (%s): len %v client %d", segData.SegNo, segData.Url, segData.Data.Len(), i)
 	}
 	return true
 }
@@ -341,6 +338,30 @@ func (d *HLSDownloader) setHLSUrl(isAlt bool, curUrl string, curHeader map[strin
 	return
 }
 
+func (d *HLSDownloader) GetClients(useMain, useAlt int, isSegUrl bool) []*http.Client {
+	clients := []*http.Client{}
+	if useMain == 0 {
+		clients = append(clients, d.AltClients...)
+	} else if useAlt == 0 {
+		clients = append(clients, d.Clients...)
+		clients = append(clients, d.Clients...)
+		if !isSegUrl {
+			clients = append(clients, d.AltClients...)
+		}
+	} else {
+		if useAlt > useMain {
+			clients = append(clients, d.AltClients...)
+			clients = append(clients, d.Clients...)
+		} else {
+			clients = d.allClients
+		}
+	}
+	if len(clients) == 0 {
+		clients = d.allClients
+	}
+	return clients
+}
+
 type M3u8ParserCallback interface {
 	m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) (status ParserStatus, additionalData interface{})
 }
@@ -398,7 +419,7 @@ func (d *HLSDownloader) m3u8Handler(isAlt bool, parser M3u8ParserCallback) error
 		//time.Sleep(10 * time.Second)
 		return nil
 	}
-	curUrl, useMain, useAlt := d.M3U8UrlRewriter.Rewrite(curUrl) // do some transform to avoid the rate limit from provider
+	curUrl = d.M3U8UrlRewriter.Rewrite(curUrl) // do some transform to avoid the rate limit from provider
 
 	// request the m3u8
 	doQuery := func(client *http.Client) {
@@ -411,8 +432,8 @@ func (d *HLSDownloader) m3u8Handler(isAlt bool, parser M3u8ParserCallback) error
 			if err != nil {
 				d.M3U8UrlRewriter.Callback(m3u8CurUrl, err)
 				logger.WithError(err).Debugf("Download m3u8 failed")
-				// if it's 404, then we need to abort
-				if strings.HasSuffix(err.Error(), "404") {
+				// if it's client error like 404/403, then we need to abort
+				if strings.HasSuffix(err.Error(), "404") || strings.HasSuffix(err.Error(), "403") {
 					func() {
 						defer func() {
 							recover()
@@ -448,9 +469,10 @@ func (d *HLSDownloader) m3u8Handler(isAlt bool, parser M3u8ParserCallback) error
 				ret, info := parser.m3u8Parser(m3u8parsedurl, m3u8, isAlt)
 				if ret == Parser_REDIRECT {
 					newUrl := info.(string)
-					log.Tracef("Got redirect to %s!", newUrl)
-					m3u8CurUrl = newUrl
-					continue
+					logger.Infof("Got redirect to %s!", newUrl)
+					d.setHLSUrl(isAlt, newUrl, curHeader)
+					//m3u8CurUrl = newUrl
+					//continue
 				} else if ret == Parser_OK {
 					// perfect!
 				} else {
@@ -462,24 +484,8 @@ func (d *HLSDownloader) m3u8Handler(isAlt bool, parser M3u8ParserCallback) error
 		}
 	}
 
-	clients := []*http.Client{}
-	if useMain == 0 {
-		clients = append(clients, d.AltClients...)
-	} else if useAlt == 0 {
-		clients = append(clients, d.Clients...)
-		clients = append(clients, d.Clients...)
-		clients = append(clients, d.AltClients...)
-	} else {
-		if useAlt > useMain {
-			clients = append(clients, d.AltClients...)
-			clients = append(clients, d.Clients...)
-		} else {
-			clients = d.allClients
-		}
-	}
-	if len(clients) == 0 {
-		clients = d.allClients
-	}
+	useMain, useAlt := stealth.GetAltProxyRuleForUrl(curUrl)
+	clients := d.GetClients(useMain, useAlt, false)
 
 	timeout := time.Millisecond * 1500
 	if isAlt {
@@ -747,6 +753,14 @@ func (d *HLSDownloader) startDownload() error {
 	d.allClients = append(d.allClients, d.Clients...)
 	d.allClients = append(d.allClients, d.AltClients...)
 
+	d.clientsMap = make(map[*http.Client]string)
+	for _, client := range d.Clients {
+		d.clientsMap[client] = "main"
+	}
+	for _, client := range d.AltClients {
+		d.clientsMap[client] = "alt"
+	}
+
 	d.AltSeqMap, _ = lru.New(16)
 	d.errChan = make(chan error)
 	d.alterrChan = make(chan error)
@@ -870,18 +884,19 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 	}
 
 	d := &HLSDownloader{
-		Logger:          entry,
-		AltAsMain:       dd.useAlt,
-		HLSUrl:          m3u8url,
-		HLSHeader:       headers,
-		AltHLSUrl:       m3u8url,
-		AltHLSHeader:    headers,
-		Clients:         clients,
-		AltClients:      altclients,
-		Video:           video,
-		OutPath:         output,
-		Cookie:          dd.cookie,
-		M3U8UrlRewriter: stealth.GetRewriter(),
+		Logger:             entry,
+		AltAsMain:          dd.useAlt,
+		HLSUrl:             m3u8url,
+		HLSHeader:          headers,
+		AltHLSUrl:          m3u8url,
+		AltHLSHeader:       headers,
+		Clients:            clients,
+		AltClients:         altclients,
+		Video:              video,
+		OutPath:            output,
+		Cookie:             dd.cookie,
+		M3U8UrlRewriter:    stealth.GetRewriter(),
+		GeneralUrlRewriter: stealth.GetRewriter(),
 		//output:    out,
 	}
 

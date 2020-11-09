@@ -12,10 +12,7 @@ import (
 func StartMonitor(mon base.VideoMonitor, usersConfig config.UsersConfig) {
 	//ticker := time.NewTicker(time.Second * time.Duration(utils.Config.CheckSec))
 	//for {
-	pm := videoworker.PluginManager{}
-	pm.AddPlugin(&plugins.PluginCQBot{})
-	pm.AddPlugin(&plugins.PluginTranslationRecorder{})
-	pm.AddPlugin(&plugins.PluginUploader{})
+	pm := plugins.GetPluginManager()
 
 	var fun = func(mon base.VideoMonitor) *interfaces.LiveStatus {
 		return &interfaces.LiveStatus{

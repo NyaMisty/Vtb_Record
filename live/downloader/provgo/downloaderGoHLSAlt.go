@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/stealth"
 	"github.com/fzxiao233/Vtb_Record/utils"
 	"golang.org/x/sync/semaphore"
 	"net/http"
@@ -80,19 +81,8 @@ func (d *HLSDownloader) handleAltSegment(segData *HLSSegment) (bool, []error) {
 			clients = d.allClients
 		}
 	} else {
-		// TODO: Refactor this
-		if strings.Contains(segData.Url, "gotcha105") {
-			clients = make([]*http.Client, 0)
-			clients = append(clients, d.Clients...)
-			clients = append(clients, d.Clients...) // double same client
-		} else if strings.Contains(segData.Url, "gotcha104") {
-			clients = []*http.Client{}
-			clients = append(clients, d.Clients...)
-			clients = append(clients, d.AltClients...)
-		} else if strings.Contains(segData.Url, "googlevideo.com") {
-			clients = []*http.Client{}
-			clients = append(clients, d.Clients...)
-		}
+		useMain, useAlt := stealth.GetAltProxyRuleForUrl(segData.Url)
+		clients = d.GetClients(useMain, useAlt, false)
 	}
 	round := 0
 breakout:
@@ -135,7 +125,16 @@ breakout:
 func (d *HLSDownloader) AltDownloader() {
 	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
+	lastTimeGood := true
 	for {
+		<-ticker.C
+		if !stealth.CheckUseAltDownloader(d.AltHLSUrl) {
+			if lastTimeGood {
+				d.Logger.WithField("alt", true).Infof("Disabled alt downloader for %s", d.AltHLSUrl)
+				lastTimeGood = false
+			}
+		}
+		lastTimeGood = true
 		err := d.m3u8Handler(true, d)
 		if err != nil {
 			if strings.Contains(err.Error(), "aborting") { // for aborting errors, we sleep for a while to avoid too much error
@@ -147,7 +146,6 @@ func (d *HLSDownloader) AltDownloader() {
 		if d.AltStopped {
 			break
 		}
-		<-ticker.C
 	}
 }
 
@@ -194,10 +192,11 @@ func (d *HLSDownloader) AltWorker() {
 		for {
 			retry += 1
 			if retry > 1 {
-				time.Sleep(30 * time.Second)
+				time.Sleep(4 * 60 * time.Second) // if we failed to retrive alt hls in 4 * 5 = 20 min, then we give up
 				if retry > 5 {
 					logger.Warnf("failed to update playlist in 5 attempts, fallback to main hls")
 					d.AltUrlUpdating.Lock()
+					d.altFallback = true
 					d.AltHLSUrl = d.HLSUrl
 					d.AltHLSHeader = d.HLSHeader
 					d.AltUrlUpdating.Unlock()
@@ -233,16 +232,13 @@ func (d *HLSDownloader) AltWorker() {
 				continue
 			}
 			// if we only have qiniu
-			if strings.Contains(m3u8url, "gotcha103") {
+			if !stealth.CheckUseAltDownloader(m3u8url) {
 				// fuck qiniu, we have to specially handle gotcha103...
-				logger.Infof("We got qiniu cdn... %s", m3u8url)
-				// if we have different althlsurl, then we've got other cdn other than qiniu cdn, so we retry!
-				// todo: still fallback if we failed too much
-				url1 := d.HLSUrl[strings.Index(d.HLSUrl, "://")+3:]
-				url2 := d.AltHLSUrl[strings.Index(d.AltHLSUrl, "://")+3:]
-				urlhost1 := url1[:strings.Index(url1, "/")]
-				urlhost2 := url2[:strings.Index(url2, "/")]
-				if urlhost1 == urlhost2 {
+				logger.Infof("We got alt-blacklisted cdn... %s", m3u8url)
+				// situation: first we got gotcha103, then we got cn-jsdx, but finally we got gotcha103
+				// if we are currently having a good url, then the altFallback would be false
+				// if we are already on a bad url, then the altFallback would be true
+				if d.altFallback {
 					m3u8url = d.HLSUrl
 					headers = d.HLSHeader
 				} else {
@@ -251,6 +247,9 @@ func (d *HLSDownloader) AltWorker() {
 					time.Sleep(270 * time.Second) // additional sleep time for this reason
 					continue                      // use the retry logic
 				}
+			} else {
+				// we are having good cdn!
+				d.altFallback = false
 			}
 
 			if m3u8url != "" {

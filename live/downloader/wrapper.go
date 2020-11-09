@@ -1,9 +1,9 @@
 package downloader
 
 import (
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader/provbase"
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader/provgo"
-	"github.com/fzxiao233/Vtb_Record/live/videoworker/downloader/provstreamlink"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/provbase"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/provgo"
+	"github.com/fzxiao233/Vtb_Record/live/downloader/provstreamlink"
 	log "github.com/sirupsen/logrus"
 )
 

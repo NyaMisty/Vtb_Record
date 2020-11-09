@@ -22,9 +22,8 @@ type UsersConfig struct {
 	Name         string
 	DownloadDir  string
 	NeedDownload bool
-	TransBiliId  string
-	UserHeaders  map[string]string
-	ExtraConfig  map[string]interface{}
+	UserHeaders  map[string]string      `json:"-"`
+	ExtraConfig  map[string]interface{} `json:"-"`
 }
 type ModuleConfig struct {
 	//EnableProxy     bool
@@ -41,18 +40,33 @@ type MainConfig struct {
 	LogFile          string
 	LogFileSize      int
 	LogLevel         string
+	FileLogLevel     string
+	FluentLogLevel   string
 	RLogLevel        string
+	PprofHost        string
 	DownloadQuality  string
 	DownloadDir      []string
 	UploadDir        string
+	AdvancedSettings AdvancedSettings
 	Module           []ModuleConfig
-	PprofHost        string
-	OutboundAddrs    []string
-	DomainRewrite    map[string]([]string)
-	RedisHost        string
-	ExpressPort      string
 	EnableTS2MP4     bool
 	ExtraConfig      map[string]interface{}
+}
+
+type AltProxyRuleEntry struct {
+	Pattern string
+	Main    int
+	Alt     int
+}
+
+type AdvancedSettings struct {
+	LoadBalance            []string
+	LoadBalanceBlacklist   []string
+	DomainRewrite          map[string]([]string)
+	M3U8Rewrite            map[string]string
+	GeneralRewrite         map[string]string
+	AltProxyRule           []AltProxyRuleEntry
+	AltDownloaderBlacklist []string
 }
 
 var v *viper.Viper
@@ -71,7 +85,7 @@ func initConfig() {
 	viper.AddConfigPath("..")
 	viper.AddConfigPath("../..")
 	viper.SetConfigType("json")*/
-	v = viper.NewWithOptions(viper.KeyDelimiter("::::"))
+	v = viper.NewWithOptions(viper.KeyDelimiter("::::"), viper.KeyPreserveCase())
 	v.SetConfigFile(viper.ConfigFileUsed())
 	v.WatchConfig()
 	err := v.ReadInConfig()
@@ -160,9 +174,29 @@ func UpdateLogLevel() {
 	logrus.Printf("Set rclone logrus level to %s", fs.Config.LogLevel)
 
 	if ConsoleHook != nil {
-		level := LevelStrParse(Config.LogLevel)
-		ConsoleHook.LogLevel = level
-		logrus.Printf("Set logrus console level to %s", level)
+		if Config.LogLevel == "disable" {
+			ConsoleHook.Enabled = false
+		} else {
+			level := LevelStrParse(Config.LogLevel)
+			ConsoleHook.LogLevel = level
+			logrus.Printf("Set logrus console level to %s", level)
+		}
+	}
+	if FileHook != nil {
+		if Config.FileLogLevel == "disable" {
+			FileHook.Enabled = false
+		} else {
+			level := LevelStrParse(Config.FileLogLevel)
+			logrus.Printf("Set logrus file level to %s", level)
+		}
+	}
+	if GoogleHook != nil {
+		if Config.FluentLogLevel == "disable" {
+			GoogleHook.Enabled = false
+		} else {
+			level := LevelStrParse(Config.FluentLogLevel)
+			logrus.Printf("Set logrus fluentd level to %s", level)
+		}
 	}
 }
 
