@@ -177,7 +177,7 @@ breakout:
 			}
 			segData.Data = ret
 			break breakout
-		case <-time.After(15 * time.Second):
+		case <-time.After(40 * time.Second):
 			// wait 10 second for each download try
 		}
 		if i == len(clients) {

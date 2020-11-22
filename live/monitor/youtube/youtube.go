@@ -27,23 +27,56 @@ type Youtube struct {
 }
 
 func getVideoInfo(ctx *base.MonitorCtx, baseHost string, channelId string) (*base.LiveInfo, error) {
+	var err error
 	url := baseHost + "/channel/" + channelId + "/live"
 	htmlBody, err := ctx.HttpGet(url, map[string]string{})
 	if err != nil {
 		return nil, err
 	}
-	re, _ := regexp.Compile(`ytplayer.config\s*=\s*([^\n]+?});`)
-	result := re.FindSubmatch(htmlBody)
-	if len(result) < 2 {
-		return nil, fmt.Errorf("youtube cannot find js_data")
+
+	parseVideoInfo1 := func() (*gjson.Result, error) {
+		re, _ := regexp.Compile(`ytplayer.config\s*=\s*([^\n]+?});`)
+		htmlBody_ := string(htmlBody)
+		result := re.FindStringSubmatch(htmlBody_)
+		if len(result) < 2 {
+			return nil, fmt.Errorf("youtube cannot find js_data")
+		}
+		jsonYtConfig := result[1]
+		playerResponse := gjson.Get(jsonYtConfig, "args.player_response")
+		if !playerResponse.Exists() {
+			return nil, fmt.Errorf("youtube cannot find player_response")
+		}
+		playerResponse = gjson.Parse(playerResponse.String())
+		return &playerResponse, nil
 	}
-	jsonYtConfig := result[1]
-	playerResponse := gjson.GetBytes(jsonYtConfig, "args.player_response")
-	if !playerResponse.Exists() {
-		return nil, fmt.Errorf("youtube cannot find player_response")
+
+	parseVideoInfo2 := func() (*gjson.Result, error) {
+		re, _ := regexp.Compile(`var\s*ytInitialPlayerResponse\s*=\s*({[^\n]+?});var`)
+		htmlBody_ := string(htmlBody)
+		result := re.FindStringSubmatch(htmlBody_)
+		if len(result) < 2 {
+			return nil, fmt.Errorf("youtube cannot find ytInitialPlayerResponse")
+		}
+		jsonYtConfig := result[1]
+		playerResponse := gjson.Parse(jsonYtConfig)
+		if !playerResponse.Exists() {
+			return nil, fmt.Errorf("youtube cannot find js_data")
+		}
+		return &playerResponse, nil
 	}
-	videoDetails := gjson.Get(playerResponse.String(), "videoDetails")
-	if !playerResponse.Exists() {
+
+	var playerResponse *gjson.Result
+	var err1 error
+	playerResponse, err1 = parseVideoInfo1()
+	if err1 != nil {
+		var err2 error
+		playerResponse, err2 = parseVideoInfo2()
+		if err2 != nil {
+			return nil, fmt.Errorf("youtube getVideoInfo failed: %v %v", err1, err2)
+		}
+	}
+	videoDetails := playerResponse.Get("videoDetails")
+	if !videoDetails.Exists() {
 		return nil, fmt.Errorf("youtube cannot find videoDetails")
 	}
 	IsLive := videoDetails.Get("isLive").Bool()

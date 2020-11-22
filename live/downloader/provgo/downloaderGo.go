@@ -101,7 +101,7 @@ func updateInfo(video *interfaces.VideoInfo, proxy string, cookie string, isAlt 
 	slErr := infoJson.Get("error").MustString()
 	if slErr != "" {
 		err = fmt.Errorf("Streamlink error: " + slErr)
-		if strings.Contains(stderr, "(abort)") {
+		if strings.Contains(slErr, "(abort)") {
 			log.WithField("video", video).WithError(err).Warnf("streamlink requested abort")
 			needAbort = true
 		}
@@ -191,7 +191,8 @@ func (d *DownloaderGo) StartDownload(video *interfaces.VideoInfo, proxy string, 
 		} else {
 			logger.WithField("alt", d.useAlt).Infof("Failed to query m3u8 url, err: %s", err)
 			if needAbort {
-				return fmt.Errorf("abort")
+				//return fmt.Errorf("abort")
+				panic("forceabort")
 			}
 		}
 	}
