@@ -58,7 +58,7 @@ func (d *StreamlinkDownload) doDownload() error {
 	defer out.Close()
 	d.StreamlinkCommand = append(d.StreamlinkCommand, []string{"--force", "--stdout"}...)
 	var stderrBuf bytes.Buffer
-	co := exec.Command("streamlink_", d.StreamlinkCommand...)
+	co := exec.Command("streamlink_", d.StreamlinkCommand...) // use original streamlink
 	stdoutIn, _ := co.StdoutPipe()
 	stderrIn, _ := co.StderrPipe()
 	stderr := &stderrBuf

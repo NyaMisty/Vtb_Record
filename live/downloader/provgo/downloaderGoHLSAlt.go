@@ -14,7 +14,7 @@ import (
 )
 
 func (d *HLSDownloader) handleAltSegment(segData *HLSSegment) (bool, []error) {
-	d.segRl.Take()
+	//d.segRl.Take()
 	if IsStub {
 		return true, nil
 	}
@@ -190,6 +190,12 @@ func (d *HLSDownloader) AltWorker() {
 		}
 		retry := 0
 		for {
+			if d.altFallback {
+				d.AltUrlUpdating.Lock()
+				d.AltHLSUrl = d.HLSUrl
+				d.AltHLSHeader = d.HLSHeader
+				d.AltUrlUpdating.Unlock()
+			}
 			retry += 1
 			if retry > 1 {
 				time.Sleep(4 * 60 * time.Second) // if we failed to retrive alt hls in 4 * 5 = 20 min, then we give up

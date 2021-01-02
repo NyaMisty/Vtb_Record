@@ -65,7 +65,7 @@ func (p *ProcessVideo) GetLogger() *log.Entry {
 }
 
 func (p *ProcessVideo) StartProcessVideo() {
-	p.GetLogger().Infof("is living. start to process")
+	//p.GetLogger().Infof("is living. start to process")
 	p.Stopped = false
 	p.needStop = false //  默认在直播中
 	p.liveStartTime = time.Now()

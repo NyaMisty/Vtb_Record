@@ -17,7 +17,7 @@ import (
 
 func SetupLoadBalance() {
 	http.DefaultTransport = &http.Transport{
-		DisableKeepAlives:  true, // disable keep alive to avoid connection reset
+		DisableKeepAlives:  false, // disable keep alive to avoid connection reset
 		DisableCompression: true,
 		IdleConnTimeout:    time.Second * 20,
 		ForceAttemptHTTP2:  false,

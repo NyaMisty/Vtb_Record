@@ -157,6 +157,13 @@
 
 在命令行下执行即可
 
+## 编译方法
+
+执行： 
+```
+goreleaser build --rm-dist --skip-validate
+```
+
 ## 支持
 
 如对本程序使用遇到问题或有建议和意见请发送issue或发送邮件至fzxiao@dd.center

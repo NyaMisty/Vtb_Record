@@ -76,7 +76,7 @@ func updateInfo(video *interfaces.VideoInfo, proxy string, cookie string, isAlt 
 		}
 	}
 	arg = append(arg, video.Target, config.Config.DownloadQuality)
-	logger.Infof("start to query, command %s", arg)
+	logger.Debugf("start to query, command %s", arg)
 	StreamlinkSemaphore.Acquire(context.Background(), 1)
 	ret, stderr := utils.ExecShellEx(logger, false, "streamlink", arg...)
 	StreamlinkSemaphore.Release(1)
