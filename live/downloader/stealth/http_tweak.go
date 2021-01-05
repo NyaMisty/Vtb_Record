@@ -17,11 +17,12 @@ import (
 
 func SetupLoadBalance() {
 	http.DefaultTransport = &http.Transport{
-		DisableKeepAlives:  false, // disable keep alive to avoid connection reset
-		DisableCompression: true,
-		IdleConnTimeout:    time.Second * 20,
-		ForceAttemptHTTP2:  false,
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConnsPerHost: 2000,
+		DisableKeepAlives:   false, // disable keep alive to avoid connection reset
+		DisableCompression:  true,
+		IdleConnTimeout:     time.Second * 20,
+		ForceAttemptHTTP2:   false,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
 			advSettings := config.Config.AdvancedSettings
 			/*addrparts := strings.SplitN(addr, ":", 2)
@@ -31,14 +32,16 @@ func SetupLoadBalance() {
 			_addr := addr
 			if domains, ok := advSettings.DomainRewrite[addr]; ok {
 				addr = utils.RandChooseStr(domains)
-				log.Debugf("Overrided %s to %s", _addr, addr)
+				log.Tracef("Overrided %s to %s", _addr, addr)
 			}
 
 			if advSettings.LoadBalance != nil && len(advSettings.LoadBalance) > 0 {
 				needLB := true // do we need to load balance? we do it in a opt-out fashion
 				if _, err := strconv.Atoi(addr[0:1]); err == nil {
 					// is it an IP Address?
-					needLB = false
+					if strings.HasPrefix(addr, "10.") || strings.HasPrefix(addr, "192.") || strings.HasPrefix(addr, "127.") || strings.HasPrefix(addr, "172.1") {
+						needLB = false
+					}
 				}
 
 				var outIp string
@@ -107,7 +110,7 @@ func SetupLoadBalance() {
 			}
 		//dialTls := nil
 		http.DefaultTransport = &http.Transport{
-			DisableKeepAlives:  true, // disable keep alive to avoid connection reset
+			DisableKeepAlives:  false, // disable keep alive to avoid connection reset
 			DisableCompression: true,
 			IdleConnTimeout:    time.Second * 10,
 			ForceAttemptHTTP2:  false,

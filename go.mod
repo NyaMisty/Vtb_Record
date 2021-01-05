@@ -25,6 +25,7 @@ require (
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
+	storj.io/common v0.0.0-20200611114417-9a3d012fdb62
 )
 
 replace github.com/rclone/rclone v1.52.2 => github.com/NyaMisty/rclone v1.52.2-mod

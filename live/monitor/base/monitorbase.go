@@ -98,8 +98,9 @@ func CreateMonitorCtx(module config.ModuleConfig) MonitorCtx {
 	if ok && proxy != "" {
 		proxyUrl, _ := url.Parse("socks5://" + proxy)
 		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			Proxy:           http.ProxyURL(proxyUrl),
+			MaxIdleConnsPerHost: 10,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			Proxy:               http.ProxyURL(proxyUrl),
 		}
 
 		//adding the Transport object to the http Client
@@ -111,7 +112,8 @@ func CreateMonitorCtx(module config.ModuleConfig) MonitorCtx {
 		//client = http.DefaultClient
 		client = &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				MaxIdleConnsPerHost: 10,
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 			},
 			Timeout: 60 * time.Second,
 		}

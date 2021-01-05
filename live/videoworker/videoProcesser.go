@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"storj.io/common/uuid"
 	"strings"
 	"time"
 )
@@ -40,6 +41,7 @@ type ProcessVideo struct {
 	needStop      bool
 	triggerChan   chan int
 	finish        chan int
+	ExtraInfo     map[string]interface{}
 }
 
 var limit *rate.Limiter
@@ -49,7 +51,14 @@ func init() {
 }
 
 func StartProcessVideo(LiveTrace monitor.LiveTrace, Monitor monitor.VideoMonitor, Plugins PluginInterface) *ProcessVideo {
-	p := &ProcessVideo{LiveTrace: LiveTrace, Monitor: Monitor, Plugins: Plugins}
+	p := &ProcessVideo{LiveTrace: LiveTrace, Monitor: Monitor, Plugins: Plugins, ExtraInfo: make(map[string]interface{})}
+	for {
+		newUuid, err := uuid.New()
+		if err == nil {
+			p.ExtraInfo["UUID"] = newUuid.String()
+			break
+		}
+	}
 	liveStatus := LiveTrace(Monitor)
 	if liveStatus.IsLive {
 		p.LiveStatus = liveStatus

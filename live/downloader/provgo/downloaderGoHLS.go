@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	m3u8Parser "github.com/etherlabsio/go-m3u8/m3u8"
+	"github.com/fzxiao233/Vtb_Record/config"
 	"github.com/fzxiao233/Vtb_Record/live/downloader/stealth"
 	"github.com/fzxiao233/Vtb_Record/live/interfaces"
 	"github.com/fzxiao233/Vtb_Record/utils"
@@ -16,6 +17,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -53,6 +55,7 @@ type HLSDownloader struct {
 	Clients    []*http.Client
 	AltClients []*http.Client
 	allClients []*http.Client
+	segClients []*http.Client
 	clientsMap map[*http.Client]string
 
 	SeqMap     sync.Map
@@ -79,6 +82,8 @@ type HLSDownloader struct {
 	altdownloadErr *cache.Cache
 
 	altSegErr sync.Map
+
+	loadBalanceData map[string]string
 }
 
 var bufPool bytebufferpool.Pool
@@ -87,7 +92,7 @@ var IsStub = false
 
 func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bool {
 	logger := d.Logger.WithField("alt", false)
-
+	startTime := time.Now()
 	// prepare the client
 	onlyAlt := false
 	// gotcha104 is tencent yun, only m3u8 blocked the foreign ip, so after that we simply ignore it
@@ -118,15 +123,23 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 		}
 		newHdr["Range"] = fmt.Sprintf("bytes=%d-", 2147483645)
 
-		res, _ = utils.HttpDo(con, clients[0], "GET", segData.Url, newHdr, nil)
+		req, _ := utils.HttpBuildRequest(con, "GET", segData.Url, newHdr, nil)
+		if req == nil {
+			logger.Warnf("Failed to peek due to build request failed!")
+			return false
+		}
+		req.Close = true
+		res, _ = utils.HttpDoRequest(con, clients[0], req)
 		if res == nil {
 			time.Sleep(time.Second * 4)
 			continue
 		}
 		tempbuf := make([]byte, 4)
 		_, _ = res.Body.Read(tempbuf)
+		_ = res.Body.Close()
+
 		if res.StatusCode == 416 {
-			//logger.Infof("Successfully peeked: %s", segData.Url)
+			logger.Debugf("Successfully peeked segment %d in %v (%s)", segData.SegNo, time.Now().Sub(startTime), segData.Url)
 			return true
 		}
 		if res.StatusCode != 200 && res.StatusCode != 206 {
@@ -143,9 +156,13 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 
 func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 	logger := d.Logger.WithField("alt", false)
+	startTime := time.Now()
 
 	if err := d.segRl.Acquire(context.Background(), 1); err == nil {
 		defer d.segRl.Release(1)
+	}
+	if d.Stopped {
+		return false
 	}
 
 	// download using a client
@@ -164,11 +181,14 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 		}
 		var newbuf *bytes.Buffer
 		var err error
-		//newbuf, err = utils.HttpGetBuffer(client, segData.Url, d.HLSHeader, nil)
-		var retBuf []byte
-		retBuf, err = utils.HttpMultiDownload(con, client, "GET", segData.Url, d.HLSHeader, nil, 400*1024*2)
-		if retBuf != nil {
-			newbuf = bytes.NewBuffer(retBuf)
+		if strings.Contains(segData.Url, "gotcha105") {
+			var retBuf []byte
+			retBuf, err = utils.HttpMultiDownload(con, client, "GET", segData.Url, d.HLSHeader, nil, 400*1024*1)
+			if retBuf != nil {
+				newbuf = bytes.NewBuffer(retBuf)
+			}
+		} else {
+			newbuf, err = utils.HttpGetBuffer(client, segData.Url, d.HLSHeader, nil)
 		}
 		if err != nil {
 			logger.WithError(err).Infof("Err when download segment %s with %s client", segData.Url, clientType)
@@ -229,6 +249,7 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 	// normally each hls seg will exist for 1 minutes
 	round := 0
 	curCon, curConCancel := context.WithCancel(context.Background())
+	curCon = context.WithValue(curCon, "logger", logger)
 	defer curConCancel()
 breakout:
 	for {
@@ -243,23 +264,24 @@ breakout:
 			}
 			segData.Data = ret
 			break breakout
-		case <-time.After(80 * time.Second):
+		case <-time.After(45 * time.Second):
 			// wait 10 second for each download try
+			logger.Infof("Retrying seg %d download...", segData.SegNo)
 		}
 		if i == len(clients) {
 			logger.Warnf("Failed all-clients to download segment %d (%s)", segData.SegNo, segData.Url)
 			round++
 		}
-		if time.Now().Sub(segData.SegArriveTime) > 120*time.Second {
+		if time.Now().Sub(segData.SegArriveTime) > 240*time.Second {
 			logger.Warnf("Failed to download segment %d within timeout...", segData.SegNo)
 			return false
 		}
 	}
 	if round > 0 {
 		// log the too long seg download and alt seg download
-		logger.Infof("Downloaded segment %d (%s): len %v client %d", segData.SegNo, segData.Url, segData.Data.Len(), i)
+		logger.Infof("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
 	} else {
-		logger.Tracef("Downloaded segment %d (%s): len %v client %d", segData.SegNo, segData.Url, segData.Data.Len(), i)
+		logger.Debugf("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
 	}
 	return true
 }
@@ -293,6 +315,7 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 			time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
 		}
 		<-con.Done()
+		time.Sleep(5 * time.Second)
 		//time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
 		/*
 			select {
@@ -450,9 +473,12 @@ func (d *HLSDownloader) GetClients(useMain, useAlt int, isSegUrl bool) []*http.C
 	if useMain == 0 {
 		clients = append(clients, d.AltClients...)
 	} else if useAlt == 0 {
-		clients = append(clients, d.Clients...)
-		clients = append(clients, d.Clients...)
-		if !isSegUrl {
+		if isSegUrl {
+			clients = append(clients, d.segClients...)
+			clients = append(clients, d.segClients...)
+		} else {
+			clients = append(clients, d.Clients...)
+			clients = append(clients, d.Clients...)
 			clients = append(clients, d.AltClients...)
 		}
 	} else {
@@ -781,8 +807,8 @@ func (d *HLSDownloader) Writer() {
 			if ok {
 				// the segment has already been retrieved
 				val := _val.(*HLSSegment)
-				if curSeq >= 30 {
-					d.SeqMap.Delete(curSeq - 30)
+				if curSeq >= 60 {
+					d.SeqMap.Delete(curSeq - 60)
 				}
 
 				if val.Data != nil {
@@ -831,7 +857,7 @@ func (d *HLSDownloader) Writer() {
 						// detect if we are lagged (e.g. we are currently at seg2, still waiting for seg3 to appear, however seg4 5 6 7 has already been downloaded)
 						isLagged := false
 						d.SeqMap.Range(func(key, value interface{}) bool {
-							if key.(int) > curSeq+3 && value.(*HLSSegment).Data != nil {
+							if key.(int) > curSeq+7 && value.(*HLSSegment).Data != nil {
 								d.Logger.Warnf("curSeq %d lags behind segData %d!", curSeq, key.(int))
 								isLagged = true
 								return false
@@ -840,9 +866,9 @@ func (d *HLSDownloader) Writer() {
 							}
 						})
 						if isLagged { // exit ASAP so that alt stream will be preserved
-							curSeq += 1
 							//d.sendErr(fmt.Errorf("Failed to load segment %d within m3u8 timeout due to lag...", curSeq))
 							d.Logger.Warnf("Failed to load segment %d within m3u8 timeout due to lag, continuing to next seg", curSeq)
+							curSeq += 1
 							continue
 						}
 					}
@@ -852,7 +878,7 @@ func (d *HLSDownloader) Writer() {
 			loadTime += 500 * time.Millisecond
 			// if load time is too long, then likely the recording is interrupted
 			if loadTime == 1*time.Minute || loadTime == 150*time.Second || loadTime == 240*time.Second {
-				go d.AltSegDownloader() // trigger alt download in advance, so we can avoid more loss
+				//go d.AltSegDownloader() // trigger alt download in advance, so we can avoid more loss
 			}
 			if loadTime > 5*time.Minute { // segNo shouldn't return to 0 within 5 min
 				// if we come to here, then the lag detect would already failed, the live must be interrupted
@@ -888,10 +914,23 @@ func (d *HLSDownloader) startDownload() error {
 	d.allClients = append(d.allClients, d.Clients...)
 	d.allClients = append(d.allClients, d.AltClients...)
 
+	d.segClients = make([]*http.Client, 0)
+	for _, cli := range d.Clients {
+		newTrans := cli.Transport.(*http.Transport).Clone()
+		d.segClients = append(d.segClients, &http.Client{
+			Transport: newTrans,
+			Timeout:   cli.Timeout,
+		})
+	}
+
 	d.clientsMap = make(map[*http.Client]string)
 	for _, client := range d.Clients {
 		d.clientsMap[client] = "main"
 	}
+	for _, client := range d.segClients {
+		d.clientsMap[client] = "main"
+	}
+
 	for _, client := range d.AltClients {
 		d.clientsMap[client] = "alt"
 	}
@@ -924,7 +963,7 @@ func (d *HLSDownloader) startDownload() error {
 	go d.Downloader()
 	go d.Worker()
 
-	if !d.AltAsMain && d.hasAlt {
+	if false && !d.AltAsMain && d.hasAlt {
 		d.Logger.Debugf("Use alt downloader")
 
 		// start the alt downloader 60 seconds later to avoid the burst query of streamlink
@@ -981,16 +1020,34 @@ func (d *HLSDownloader) startDownload() error {
 
 // initialize the go hls downloader
 func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *interfaces.VideoInfo, m3u8url string, headers map[string]string, needMove bool) error {
+	lbData := make(map[string]string)
+	advSettings := config.Config.AdvancedSettings
+	for k, v := range advSettings.DomainRewrite {
+		lbData[k] = utils.RandChooseStr(v)
+	}
+
 	clients := []*http.Client{
 		{
 			Transport: &http.Transport{
+				MaxIdleConnsPerHost:   2000,
+				IdleConnTimeout:       5 * time.Second,
 				ResponseHeaderTimeout: 20 * time.Second,
 				TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 				DisableCompression:    true,
 				DisableKeepAlives:     false,
 				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-				DialContext:           http.DefaultTransport.(*http.Transport).DialContext,
-				DialTLS:               http.DefaultTransport.(*http.Transport).DialTLS,
+				DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+					if logger := ctx.Value("logger"); logger != nil {
+						logger.(*log.Entry).WithError(err).Debugf("Connecting %s %s", network, addr)
+					}
+					_addr := addr
+					if domain, ok := lbData[addr]; ok {
+						addr = domain
+						log.Tracef("Overrided %s to %s", _addr, addr)
+					}
+					return http.DefaultTransport.(*http.Transport).DialContext(ctx, network, addr)
+				},
+				DialTLS: http.DefaultTransport.(*http.Transport).DialTLS,
 			},
 			Timeout: 180 * time.Second,
 		},
@@ -1005,10 +1062,11 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 		altclients = []*http.Client{
 			{
 				Transport: &http.Transport{
-					TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-					Proxy:        http.ProxyURL(proxyUrl),
+					MaxIdleConnsPerHost: 2,
+					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+					Proxy:               http.ProxyURL(proxyUrl),
 					//DisableCompression: true,
-					DisableKeepAlives: false,
+					DisableKeepAlives: true,
 					TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 				},
 				Timeout: 100 * time.Second,

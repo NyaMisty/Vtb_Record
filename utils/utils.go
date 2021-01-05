@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/mitchellh/mapstructure"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 	"io"
 	"math/rand"
 	"net/http"
@@ -43,10 +44,7 @@ func HttpGetBuffer(client *http.Client, url string, header map[string]string, bu
 	return HttpDoWithBufferEx(context.Background(), client, "GET", url, header, nil, buf)
 }
 
-func HttpDo(ctx context.Context, client *http.Client, meth string, url string, header map[string]string, data []byte) (*http.Response, error) {
-	if client == nil {
-		client = &http.Client{}
-	}
+func HttpBuildRequest(ctx context.Context, meth string, url string, header map[string]string, data []byte) (*http.Request, error) {
 	var dataReader io.Reader
 	if data != nil {
 		dataReader = bytes.NewReader(data)
@@ -60,6 +58,10 @@ func HttpDo(ctx context.Context, client *http.Client, meth string, url string, h
 	for k, v := range header {
 		req.Header.Set(k, v)
 	}
+	return req, err
+}
+
+func HttpDoRequest(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
 	res, err := client.Do(req)
 	if err != nil || res == nil {
 		err = fmt.Errorf("HttpGet error %w", err)
@@ -80,6 +82,17 @@ func HttpDo(ctx context.Context, client *http.Client, meth string, url string, h
 		}
 	}
 	return res, nil
+}
+
+func HttpDo(ctx context.Context, client *http.Client, meth string, url string, header map[string]string, data []byte) (*http.Response, error) {
+	if client == nil {
+		client = &http.Client{}
+	}
+	req, err := HttpBuildRequest(ctx, meth, url, header, data)
+	if err != nil {
+		return nil, err
+	}
+	return HttpDoRequest(ctx, client, req)
 }
 
 func HttpRawDoWithBufferEx(ctx context.Context, client *http.Client, meth string, url string, header map[string]string, data []byte, buf io.Writer) (*bytes.Buffer, *http.Response, error) {
@@ -156,10 +169,13 @@ func HttpPost(client *http.Client, url string, header map[string]string, data []
 	}
 }
 
+var totalSem = semaphore.NewWeighted(4200)
+
 func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
-	res, err := HttpDo(ctx, client, meth, url, header, data)
+	startTime := time.Now()
+	res, err := HttpDo(ctx, client, "HEAD", url, header, data)
 	if res != nil {
-		_ = res.Body.Close()
+		defer res.Body.Close()
 	}
 	if err != nil {
 		return nil, err
@@ -182,9 +198,14 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 	if length < chunkSize {
 		chunkSize = length
 	}
+	segTimeout := time.Second * 15
+
+	sem := semaphore.NewWeighted(10)
+
 	ret := make([]byte, length)
 	var wg sync.WaitGroup
 	var retErr error = nil
+
 	for i := 0; i < thread; i++ {
 		wg.Add(1)
 		min := chunkSize * int64(i)   // Min range
@@ -193,11 +214,22 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 			max = -1
 		}
 		go func(min int64, max int64, i int) {
+			if err := totalSem.Acquire(ctx, 1); err == nil {
+				defer totalSem.Release(1)
+			}
+			if err := sem.Acquire(ctx, 1); err == nil {
+				defer sem.Release(1)
+			} else {
+				wg.Done()
+				retErr = fmt.Errorf("failed to acquire sem, err: %v", err)
+				return
+			}
 			curTime := 0
+			errs := make([]error, 0)
 			for {
-				if curTime > 10 {
-					log.WithError(err).Warnf("Failed to download chunk %d for %s", i, url)
-					retErr = fmt.Errorf("download chunk %d failed", i)
+				if /*curTime > 10 || */ time.Now().Sub(startTime) > 60*time.Second {
+					//log.Warnf("Failed to download chunk %d for %s, errors: %v", i, url, errs)
+					retErr = fmt.Errorf("download chunk %d for %s failed, errors: %v", i, url, errs)
 					break
 				}
 				curTime++
@@ -213,7 +245,112 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 				}
 
 				curHdr["Range"] = bytesrange
-				res, err = HttpDo(ctx, client, meth, url, curHdr, data)
+				curCtx, _ := context.WithTimeout(ctx, segTimeout)
+				res, err = HttpDo(curCtx, client, meth, url, curHdr, data)
+
+				if err == nil && res.StatusCode != 206 {
+					err = fmt.Errorf("unknown status code %d for multi-down", res.StatusCode)
+				}
+
+				if err == nil {
+					targetSlice := ret[min:]
+					if max != -1 {
+						targetSlice = ret[min:max]
+					}
+					_, err = io.ReadFull(res.Body, targetSlice)
+				}
+				if res != nil {
+					_ = res.Body.Close()
+				}
+
+				if err != nil {
+					/*if logger := ctx.Value("logger"); logger != nil {
+						logger.(*log.Entry).WithError(err).Debugf("Failed to download chunk %d for %s", i, url)
+					}*/
+					time.Sleep(time.Second * 2)
+					errs = append(errs, err)
+					continue
+				}
+				break
+			}
+			wg.Done()
+		}(min, max, i)
+	}
+	wg.Wait()
+	return ret, retErr
+}
+
+func HttpMultiDownload1(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
+	res, err := HttpDo(ctx, client, meth, url, header, data)
+	if res != nil {
+		_ = res.Body.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	var length int64 = 0
+	if hdrs, ok := res.Header["Content-Length"]; ok {
+		if len(hdrs) != 0 {
+			length, err = strconv.ParseInt(hdrs[0], 10, 64)
+		}
+	}
+	if length <= 0 {
+		return nil, fmt.Errorf("cannot get target file size")
+	}
+
+	thread := int(length / chunkSize)
+	if thread == 0 {
+		thread = 1
+	}
+	if thread > 16 {
+		thread = 16
+	}
+
+	if length < chunkSize {
+		chunkSize = length
+	}
+	segTimeout := time.Second * 30
+	oriChunkSize := chunkSize
+	chunkSize = length / int64(thread)
+	if oriChunkSize == 0 {
+		oriChunkSize = chunkSize
+	}
+	segTimeout = time.Duration(chunkSize/oriChunkSize) * segTimeout
+	ret := make([]byte, length)
+	var wg sync.WaitGroup
+	var retErr error = nil
+
+	for i := 0; i < thread; i++ {
+		wg.Add(1)
+		min := chunkSize * int64(i)   // Min range
+		max := chunkSize * int64(i+1) // Max range
+		if i == thread-1 {
+			max = -1
+		}
+		go func(min int64, max int64, i int) {
+			curTime := 0
+			errs := make([]error, 0)
+			for {
+				if curTime > 4 {
+					//log.Warnf("Failed to download chunk %d for %s, errors: %v", i, url, errs)
+					retErr = fmt.Errorf("download chunk %d for %s failed, errors: %v", i, url, errs)
+					break
+				}
+				curTime++
+				curHdr := make(map[string]string)
+				for k, v := range header {
+					curHdr[k] = v
+				}
+				var bytesrange string
+				if max != -1 {
+					bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-" + strconv.FormatInt(max-1, 10)
+				} else {
+					bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-"
+				}
+
+				curHdr["Range"] = bytesrange
+				curCtx, _ := context.WithTimeout(ctx, segTimeout)
+				res, err = HttpDo(curCtx, client, meth, url, curHdr, data)
 
 				if err == nil {
 					targetSlice := ret[min:]
@@ -228,7 +365,8 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 
 				if err != nil {
 					//log.WithError(err).Debugf("Failed to download chunk %d for %s", i, url)
-					time.Sleep(time.Second * 2)
+					//time.Sleep(time.Second * 2)
+					errs = append(errs, err)
 					continue
 				}
 				break

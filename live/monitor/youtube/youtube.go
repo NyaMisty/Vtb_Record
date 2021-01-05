@@ -158,10 +158,13 @@ func (y *YoutubePoller) parseSubscStatus(rawPage string) (map[string]base.LiveIn
 
 		if style.String() == "BADGE_STYLE_TYPE_LIVE_NOW" {
 			channelId := item.Get("gridVideoRenderer.shortBylineText.runs.0.navigationEndpoint.browseEndpoint.browseId")
-			//title := item.Get("gridVideoRenderer.shortBylineText.runs.0.text")
 			videoId := item.Get("gridVideoRenderer.videoId")
 			//video_thumbnail := item.Get("gridVideoRenderer.thumbnail.thumbnails.0.url")
-			videoTitle := item.Get("gridVideoRenderer.title.simpleText")
+
+			//title := item.Get("gridVideoRenderer.shortBylineText.runs.0.text")
+			//videoTitle := item.Get("gridVideoRenderer.title.simpleText")
+			videoTitle := item.Get("gridVideoRenderer.title.runs.0.text")
+
 			//upcomingEventData := item.Get("gridVideoRenderer.upcomingEventData")
 
 			livingUids[channelId.String()] = base.LiveInfo{
@@ -211,6 +214,21 @@ func (y *YoutubePoller) getLiveStatus() error {
 	}
 
 	livingUids := make(map[string]base.LiveInfo)
+
+	rawPage, err := ctx.HttpGet(
+		RandChooseStr(apihosts)+"/feed/subscriptions/",
+		map[string]string{})
+	if err != nil {
+		return err
+	}
+	page := string(rawPage)
+	subscUids, err := y.parseSubscStatus(page)
+	if err != nil {
+		return err
+	}
+	for k, v := range subscUids {
+		livingUids[k] = v
+	}
 
 	cookie, ok := ctx.GetHeaders()["Cookie"]
 	if !ok {
@@ -263,21 +281,6 @@ func (y *YoutubePoller) getLiveStatus() error {
 				log.WithError(err).Warnf("Failed to get live info for channel %s", chanId)
 			}
 		}
-	}
-
-	rawPage, err := ctx.HttpGet(
-		RandChooseStr(apihosts)+"/feed/subscriptions/",
-		map[string]string{})
-	if err != nil {
-		return err
-	}
-	page := string(rawPage)
-	subscUids, err := y.parseSubscStatus(page)
-	if err != nil {
-		return err
-	}
-	for k, v := range subscUids {
-		livingUids[k] = v
 	}
 
 	y.LivingUids = livingUids

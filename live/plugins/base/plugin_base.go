@@ -11,9 +11,9 @@ import (
 )
 
 type PluginBase struct {
-	Name	string
-	V		*viper.Viper
-	ConfigMutex		  sync.Mutex
+	Name        string
+	V           *viper.Viper
+	ConfigMutex sync.Mutex
 	Plugin
 }
 
@@ -32,7 +32,6 @@ func (p *PluginBase) GetLogger(process *videoworker.ProcessVideo) *log.Entry {
 func (p *PluginBase) UpdateLogger(logger *log.Entry) *log.Entry {
 	return logger.WithField("plugin", p.Name)
 }
-
 
 func (p *PluginBase) ReloadConfigWrap() {
 	logger := p.GetRawLogger()
@@ -74,19 +73,21 @@ func (p *PluginBase) LiveEnd(process *videoworker.ProcessVideo) error {
 }
 
 type LiveStartMsg struct {
-	Type	 string    `json:"type"`
-	Provider string    `json:"provider"`
-	Title 	 string    `json:"title"`
-	Target   string    `json:"target"`
-	User     config.UsersConfig    `json:"user"`
+	UUID     string             `json:"uuid"`
+	Type     string             `json:"type"`
+	Provider string             `json:"provider"`
+	Title    string             `json:"title"`
+	Target   string             `json:"target"`
+	User     config.UsersConfig `json:"user"`
 }
 
 func MakeLiveStartMsg(process *videoworker.ProcessVideo) ([]byte, error) {
 	video := process.LiveStatus.Video
 	msg := &LiveStartMsg{
-		Type: "start",
+		UUID:     process.ExtraInfo["UUID"].(string),
+		Type:     "start",
 		Provider: video.Provider,
-		Title: 	  video.Title,
+		Title:    video.Title,
 		Target:   video.Target,
 		User:     video.UsersConfig,
 	}
@@ -94,21 +95,23 @@ func MakeLiveStartMsg(process *videoworker.ProcessVideo) ([]byte, error) {
 }
 
 type LiveEndMsg struct {
-	Type	 string                                     `json:"type"`
-	Provider string                                     `json:"provider"`
-	TitleHistory 	[]videoworker.LiveTitleHistoryEntry `json:"title_history"`
-	Target   string                                     `json:"target"`
-	User     config.UsersConfig                         `json:"user"`
+	UUID         string                              `json:"uuid"`
+	Type         string                              `json:"type"`
+	Provider     string                              `json:"provider"`
+	TitleHistory []videoworker.LiveTitleHistoryEntry `json:"title_history"`
+	Target       string                              `json:"target"`
+	User         config.UsersConfig                  `json:"user"`
 }
 
 func MakeLiveEndMsg(process *videoworker.ProcessVideo) ([]byte, error) {
 	video := process.LiveStatus.Video
 	msg := &LiveEndMsg{
-		Type:     "end",
-		Provider: video.Provider,
-		TitleHistory: 	  process.TitleHistory,
-		Target:   video.Target,
-		User:     video.UsersConfig,
+		UUID:         process.ExtraInfo["UUID"].(string),
+		Type:         "end",
+		Provider:     video.Provider,
+		TitleHistory: process.TitleHistory,
+		Target:       video.Target,
+		User:         video.UsersConfig,
 	}
 	return json.Marshal(msg)
 }

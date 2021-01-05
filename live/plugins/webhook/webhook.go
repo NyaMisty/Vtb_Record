@@ -57,6 +57,7 @@ func (p *PluginWebhook) LiveStart(process *videoworker.ProcessVideo) error {
 	if !p.enabled(process) {
 		return nil
 	}
+
 	msgData, err := base.MakeLiveStartMsg(process)
 	if err != nil {
 		p.GetLogger(process).Warnf("Failed to serialize live start msg, err: %s", err)

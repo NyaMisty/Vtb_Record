@@ -1,4 +1,4 @@
 {
   "Enable": true,
-  "CallbackUrl": "http://127.0.0.1:12345/111"
+  "CallbackUrl": "http://127.0.0.1:8000/vtbrec?i=misty_vtbrec"
 }
