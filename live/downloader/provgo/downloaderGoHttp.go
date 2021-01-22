@@ -26,7 +26,7 @@ func doDownloadHttp(entry *log.Entry, output string, url string, headers map[str
 	defer out.Close()
 
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: 2000,
+		MaxIdleConnsPerHost: 8000,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 	}
 

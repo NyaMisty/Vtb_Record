@@ -81,7 +81,11 @@ func updateInfo(video *interfaces.VideoInfo, proxy string, cookie string, isAlt 
 	ret, stderr := utils.ExecShellEx(logger, false, "streamlink", arg...)
 	StreamlinkSemaphore.Release(1)
 	if stderr != "" {
-		logger.Infof("Streamlink err output: %s", stderr)
+		defer func() {
+			if err != nil {
+				logger.Infof("Streamlink err output: %s", stderr)
+			}
+		}()
 		if strings.Contains(stderr, "(abort)") {
 			err = fmt.Errorf("streamlink requested abort")
 			needAbort = true

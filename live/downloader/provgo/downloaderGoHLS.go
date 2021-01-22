@@ -2,6 +2,7 @@ package provgo
 
 import (
 	"bytes"
+	"container/ring"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -14,8 +15,10 @@ import (
 	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/bytebufferpool"
+	"golang.org/x/net/http2"
 	"golang.org/x/sync/semaphore"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -55,6 +58,7 @@ type HLSDownloader struct {
 	Clients    []*http.Client
 	AltClients []*http.Client
 	allClients []*http.Client
+	h2Clients  []*http.Client
 	segClients []*http.Client
 	clientsMap map[*http.Client]string
 
@@ -67,7 +71,8 @@ type HLSDownloader struct {
 	AltStopped bool
 	output     io.Writer
 	//segRl      ratelimit.Limiter
-	segRl *semaphore.Weighted
+	segLens *ring.Ring
+	segRl   *semaphore.Weighted
 
 	firstSeqChan chan int
 	hasAlt       bool
@@ -84,6 +89,7 @@ type HLSDownloader struct {
 	altSegErr sync.Map
 
 	loadBalanceData map[string]string
+	useH2           bool
 }
 
 var bufPool bytebufferpool.Pool
@@ -111,6 +117,11 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 		clients = d.GetClients(useMain, useAlt, true)
 		//logger.Tracef("Downloading segment %d (%s) useMain %d useAlt %d", segData.SegNo, segData.Url, useMain, useAlt)
 	}
+	client := clients[0]
+	tempCli := utils.CloneHttpClient(client, func(transport *http.Transport) http.RoundTripper {
+		transport.DisableKeepAlives = true
+		return transport
+	})
 
 	round := 0
 	for {
@@ -122,24 +133,33 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 			newHdr[k] = v
 		}
 		newHdr["Range"] = fmt.Sprintf("bytes=%d-", 2147483645)
-
-		req, _ := utils.HttpBuildRequest(con, "GET", segData.Url, newHdr, nil)
-		if req == nil {
-			logger.Warnf("Failed to peek due to build request failed!")
-			return false
+		doReq := func() *http.Response {
+			req, _ := utils.HttpBuildRequest(con, "GET", segData.Url, newHdr, nil)
+			if req == nil {
+				logger.Warnf("Failed to peek due to build request failed!")
+				return nil
+			}
+			//req.Close = true
+			res, _ = utils.HttpDoRequest(con, tempCli, req)
+			if res == nil {
+				return nil
+			}
+			tempbuf := make([]byte, 4)
+			_, _ = res.Body.Read(tempbuf)
+			_ = res.Body.Close()
+			return res
 		}
-		req.Close = true
-		res, _ = utils.HttpDoRequest(con, clients[0], req)
+		res = doReq()
 		if res == nil {
 			time.Sleep(time.Second * 4)
 			continue
 		}
-		tempbuf := make([]byte, 4)
-		_, _ = res.Body.Read(tempbuf)
-		_ = res.Body.Close()
 
 		if res.StatusCode == 416 {
-			logger.Debugf("Successfully peeked segment %d in %v (%s)", segData.SegNo, time.Now().Sub(startTime), segData.Url)
+			logger.Debugf("Successfully peeked segment %d in %v", segData.SegNo, time.Now().Sub(startTime))
+			newHdr["Range"] = fmt.Sprintf("bytes=1-1,409601-409601,819201-819201,1228801-1882201,1638400-1638401," +
+				"2048000-2048001,3072000-3072001,3584000-3584001,4096000-4096001")
+			doReq()
 			return true
 		}
 		if res.StatusCode != 200 && res.StatusCode != 206 {
@@ -165,6 +185,7 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 		return false
 	}
 
+	finished := false
 	// download using a client
 	downChan := make(chan *bytes.Buffer)
 	defer func() {
@@ -191,7 +212,9 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 			newbuf, err = utils.HttpGetBuffer(client, segData.Url, d.HLSHeader, nil)
 		}
 		if err != nil {
-			logger.WithError(err).Infof("Err when download segment %s with %s client", segData.Url, clientType)
+			if !finished {
+				logger.WithError(err).Infof("Err when download segment %s with %s client", segData.Url, clientType)
+			}
 			// if it's 404, then we'll never be able to download it later, stop the useless retry
 			if strings.HasSuffix(err.Error(), "404") {
 				func() {
@@ -207,7 +230,7 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 			}
 		} else {
 			usedTime := time.Now().Sub(s)
-			if usedTime > time.Second*20 {
+			if usedTime > time.Second*39 {
 				// we used too much time to download a segment
 				logger.Infof("Download %d used %s with %s client (%s)", segData.SegNo, usedTime, clientType, segData.Url)
 			}
@@ -264,9 +287,9 @@ breakout:
 			}
 			segData.Data = ret
 			break breakout
-		case <-time.After(45 * time.Second):
+		case <-time.After(60 * time.Second):
 			// wait 10 second for each download try
-			logger.Infof("Retrying seg %d download...", segData.SegNo)
+			logger.Infof("Retrying seg %d download, last round %d client %d", segData.SegNo, round, i-1)
 		}
 		if i == len(clients) {
 			logger.Warnf("Failed all-clients to download segment %d (%s)", segData.SegNo, segData.Url)
@@ -281,8 +304,10 @@ breakout:
 		// log the too long seg download and alt seg download
 		logger.Infof("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
 	} else {
-		logger.Debugf("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
+		//logger.Debugf("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
+		logger.Debugf("Downloaded segment %d: len %v client %d using %v", segData.SegNo, segData.Data.Len(), i, time.Now().Sub(startTime))
 	}
+	finished = true
 	return true
 }
 
@@ -315,7 +340,7 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 			time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
 		}
 		<-con.Done()
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 		//time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
 		/*
 			select {
@@ -375,8 +400,8 @@ func (d *HLSDownloader) m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) 
 			return Parser_REDIRECT, item.URI
 		case *m3u8Parser.SegmentItem:
 			seqNo := curseq + seg_i
-			if playlist.IsLive() && seg_i == 0 {
-				d.SegLen = item.Duration
+			if playlist.IsLive() /* && seg_i == 0*/ {
+				//d.SegLen = (d.SegLen * 3 + item.Duration) / 4
 			}
 			seg_i += 1
 			segs = append(segs, item.Segment)
@@ -384,8 +409,26 @@ func (d *HLSDownloader) m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) 
 			if !isAlt {
 				_segData, loaded := d.SeqMap.LoadOrStore(seqNo, &HLSSegment{SegNo: seqNo, SegArriveTime: time.Now(), Url: getSegUrl(item.Segment)})
 				if !loaded {
+					// update seglen
+					d.segLens.Value = item.Duration
+					d.segLens = d.segLens.Next()
+					newLen := 0.0
+					segnum := 0
+					d.segLens.Do(func(i interface{}) {
+						if t, ok := i.(float64); ok {
+							newLen += t
+							segnum += 1
+						}
+					})
+					d.SegLen = newLen / float64(segnum)
+
+					// handle segment
 					segData := _segData.(*HLSSegment)
-					logger.Debugf("Got new seg %d %s", seqNo, segData.Url)
+					if strings.Contains(segData.Url, "googlevideo") { // google's url is toooooo looooong
+						logger.Debugf("Got new seg %d %s", seqNo, segData.Url[0:50])
+					} else {
+						logger.Debugf("Got new seg %d %s", seqNo, segData.Url)
+					}
 					go d.handleSegment(segData)
 				}
 			} else {
@@ -455,6 +498,9 @@ func (d *HLSDownloader) setHLSUrl(isAlt bool, curUrl string, curHeader map[strin
 		d.HLSUrl = curUrl
 		if curHeader != nil {
 			d.HLSHeader = curHeader
+			if strings.Contains(curUrl, "gotcha105") {
+				d.HLSHeader["User-Agent"] = "nil"
+			}
 		}
 		d.UrlUpdating.Unlock()
 	} else {
@@ -477,9 +523,14 @@ func (d *HLSDownloader) GetClients(useMain, useAlt int, isSegUrl bool) []*http.C
 			clients = append(clients, d.segClients...)
 			clients = append(clients, d.segClients...)
 		} else {
-			clients = append(clients, d.Clients...)
-			clients = append(clients, d.Clients...)
-			clients = append(clients, d.AltClients...)
+			if d.useH2 {
+				clients = append(clients, d.h2Clients...)
+				clients = append(clients, d.h2Clients...)
+			} else {
+				clients = append(clients, d.Clients...)
+				clients = append(clients, d.Clients...)
+			}
+			//clients = append(clients, d.AltClients...)
 		}
 	} else {
 		if useAlt > useMain {
@@ -571,11 +622,11 @@ func (d *HLSDownloader) m3u8Handler(isAlt bool, parser M3u8ParserCallback) error
 						defer func() {
 							recover()
 						}()
-						logger.WithError(err).Warnf("Download aborting because of 404/403")
 						ch := retchan
 						if ch == nil {
 							return
 						}
+						logger.WithError(err).Infof("Download aborting because of 404/403")
 						ch <- nil // abort!
 					}()
 				} else {
@@ -649,14 +700,36 @@ breakout:
 	return nil
 }
 
+func (d *HLSDownloader) refreshClient() {
+	for _, cli := range d.h2Clients {
+		cli.CloseIdleConnections()
+		oriTrans := cli.Transport.(*http2.Transport)
+		oriTrans.CloseIdleConnections()
+		cli.Transport = &http2.Transport{
+			DialTLS:            oriTrans.DialTLS,
+			TLSClientConfig:    oriTrans.TLSClientConfig,
+			DisableCompression: oriTrans.DisableCompression,
+			AllowHTTP:          oriTrans.AllowHTTP,
+			ReadIdleTimeout:    oriTrans.ReadIdleTimeout,
+			PingTimeout:        oriTrans.PingTimeout,
+		}
+	}
+	for _, cli := range d.h2Clients {
+		cli.CloseIdleConnections()
+	}
+}
+
 // query main m3u8 every 2 seconds
 func (d *HLSDownloader) Downloader() {
 	curDuration := 2.0
 	ticker := time.NewTicker(time.Duration(float64(time.Second) * curDuration))
 	breakflag := false
+	lastHandleTime := time.Now()
+	shakeCount := 0
 	for {
 		go func() {
 			err := d.m3u8Handler(false, d)
+			lastHandleTime = time.Now()
 			if err != nil {
 				d.sendErr(err) // we have error, break out now
 				breakflag = true
@@ -672,15 +745,43 @@ func (d *HLSDownloader) Downloader() {
 		if d.Stopped {
 			break
 		}
+		lastUpdate := time.Now().Sub(lastHandleTime)
+		if time.Now().Sub(lastHandleTime) > time.Duration(float64(time.Second)*1.5*d.SegLen) {
+			d.Logger.Infof("Detected potential lag (%v since last update)! Retrying at once!", lastUpdate)
+			lastHandleTime = time.Now()
+			d.refreshClient()
+			continue
+		}
 		<-ticker.C // if the handler takes too long, the next tick will arrive at once
+
+		newDuration := curDuration
 		if d.SegLen < curDuration {
-			ticker.Stop()
-			curDuration = d.SegLen * 0.8
-			if curDuration < 0.8 {
-				curDuration = 0.8
+			if ret := curDuration - d.SegLen; ret/d.SegLen > 0.18 && ret > 0.6 {
+				newDuration = (d.SegLen + curDuration) / 2
+				if newDuration < 1.0 {
+					newDuration = 1.0
+				}
+				d.Logger.Infof("Using new hls interval: %f", newDuration*0.8)
 			}
-			d.Logger.Infof("Using new hls interval: %f", curDuration)
-			ticker = time.NewTicker(time.Duration(float64(time.Second) * curDuration))
+			shakeCount = 0
+		} else {
+			if ret := math.Abs(d.SegLen - curDuration); ret/d.SegLen > 0.18 && ret > 0.8 {
+				shakeCount += 1
+				if shakeCount >= 3 { // segLen are more keen to go lower
+					newDuration = (d.SegLen + curDuration) / 2
+					if newDuration < 1.0 {
+						newDuration = 1.0
+					}
+				}
+			} else {
+				shakeCount = 0
+			}
+		}
+		if newDuration != curDuration {
+			ticker.Stop()
+			curDuration = newDuration
+			d.Logger.Infof("Using new hls interval: %f", curDuration*0.8)
+			ticker = time.NewTicker(time.Duration(float64(time.Second) * curDuration * 0.8))
 		}
 	}
 	ticker.Stop()
@@ -737,7 +838,7 @@ func (d *HLSDownloader) Worker() {
 			// check if we have error or need abort
 			needAbort, err, infoJson := updateInfo(d.Video, "", d.Cookie, alt)
 			if needAbort {
-				d.Logger.WithError(err).Warnf("Streamlink requests to abort, worker finishing...")
+				d.Logger.WithError(err).Debugf("Streamlink requests to abort, worker finishing...")
 				// if we have entered live
 				d.sendErr(fmt.Errorf("Streamlink requests to abort: %s", err))
 				return
@@ -808,7 +909,12 @@ func (d *HLSDownloader) Writer() {
 				// the segment has already been retrieved
 				val := _val.(*HLSSegment)
 				if curSeq >= 60 {
-					d.SeqMap.Delete(curSeq - 60)
+					d.SeqMap.Range(func(key, value interface{}) bool {
+						if key.(int) <= curSeq-60 {
+							d.SeqMap.Delete(curSeq - 60)
+						}
+						return true
+					})
 				}
 
 				if val.Data != nil {
@@ -846,18 +952,36 @@ func (d *HLSDownloader) Writer() {
 			} else {
 				if loadTime > 20*time.Second {
 					// segment is not loaded
-					if d.lastSeqNo > 3 && d.lastSeqNo+2 < curSeq { // seqNo got reset to 0
-						d.Logger.Warnf("Failed to load segment %d due to segNo got reset to %d", curSeq)
-						// exit ASAP so that alt stream will be preserved
-						curSeq = getMinNo()
-						continue
-						//d.sendErr(fmt.Errorf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo))
-						//return
-					} else {
+					{
+						// detect seqNo got reset to 1
+						if d.lastSeqNo > 3 && d.lastSeqNo+4 < curSeq {
+							hasLargerId := false
+							d.SeqMap.Range(func(key, value interface{}) bool {
+								if key.(int) > curSeq {
+									hasLargerId = true
+									return false
+								} else {
+									return true
+								}
+							})
+							if !hasLargerId {
+								d.Logger.Warnf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo)
+								curSeq = getMinNo()
+								continue
+								// exit ASAP so that alt stream will be preserved
+								//d.sendErr(fmt.Errorf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo))
+								//return
+							} else {
+								// fall into lag check instead
+							}
+						}
+					}
+
+					{
 						// detect if we are lagged (e.g. we are currently at seg2, still waiting for seg3 to appear, however seg4 5 6 7 has already been downloaded)
 						isLagged := false
 						d.SeqMap.Range(func(key, value interface{}) bool {
-							if key.(int) > curSeq+7 && value.(*HLSSegment).Data != nil {
+							if key.(int) > curSeq+4 && value.(*HLSSegment).Data != nil {
 								d.Logger.Warnf("curSeq %d lags behind segData %d!", curSeq, key.(int))
 								isLagged = true
 								return false
@@ -867,8 +991,16 @@ func (d *HLSDownloader) Writer() {
 						})
 						if isLagged { // exit ASAP so that alt stream will be preserved
 							//d.sendErr(fmt.Errorf("Failed to load segment %d within m3u8 timeout due to lag...", curSeq))
-							d.Logger.Warnf("Failed to load segment %d within m3u8 timeout due to lag, continuing to next seg", curSeq)
-							curSeq += 1
+							nextSeq := 2147483647
+							d.SeqMap.Range(func(key, value interface{}) bool {
+								if key.(int) > curSeq && key.(int) < nextSeq {
+									nextSeq = key.(int)
+									return false
+								}
+								return true
+							})
+							d.Logger.Warnf("Failed to load segment %d within m3u8 timeout due to lag, continuing to next seg %d", curSeq, nextSeq)
+							curSeq = nextSeq
 							continue
 						}
 					}
@@ -880,10 +1012,25 @@ func (d *HLSDownloader) Writer() {
 			if loadTime == 1*time.Minute || loadTime == 150*time.Second || loadTime == 240*time.Second {
 				//go d.AltSegDownloader() // trigger alt download in advance, so we can avoid more loss
 			}
-			if loadTime > 5*time.Minute { // segNo shouldn't return to 0 within 5 min
+			if loadTime > 3*time.Minute { // segNo shouldn't return to 0 within 5 min
 				// if we come to here, then the lag detect would already failed, the live must be interrupted
-				d.sendErr(fmt.Errorf("Failed to load segment %d within timeout...", curSeq))
-				return
+				newSeq := 2147483647
+				d.SeqMap.Range(func(key, value interface{}) bool {
+					if key.(int) > curSeq && key.(int) < newSeq {
+						newSeq = key.(int)
+						return false
+					} else {
+						return true
+					}
+				})
+				if newSeq != 2147483647 {
+					d.Logger.Warnf("Failed to load segment %d within timeout, continuing to segment %d", curSeq, newSeq)
+					curSeq = newSeq
+					continue
+				} else {
+					d.sendErr(fmt.Errorf("Failed to load segment %d within timeout...", curSeq))
+					return
+				}
 			}
 			if curSeq == d.FinishSeq { // successfully finished
 				d.sendErr(nil)
@@ -905,10 +1052,16 @@ func (d *HLSDownloader) startDownload() error {
 	d.segRl = semaphore.NewWeighted(3)
 
 	d.SegLen = 2.0
+	d.segLens = ring.New(4)
 
 	writer := utils.GetWriter(d.OutPath)
 	d.output = writer
 	defer writer.Close()
+
+	d.useH2 = false
+	/*if strings.Contains(d.HLSUrl, "gotcha105") {
+		d.useH2 = true
+	}*/
 
 	d.allClients = make([]*http.Client, 0)
 	d.allClients = append(d.allClients, d.Clients...)
@@ -916,11 +1069,10 @@ func (d *HLSDownloader) startDownload() error {
 
 	d.segClients = make([]*http.Client, 0)
 	for _, cli := range d.Clients {
-		newTrans := cli.Transport.(*http.Transport).Clone()
-		d.segClients = append(d.segClients, &http.Client{
-			Transport: newTrans,
-			Timeout:   cli.Timeout,
-		})
+		d.segClients = append(d.segClients, utils.CloneHttpClient(cli, nil))
+		d.h2Clients = append(d.h2Clients, utils.CloneHttpClient(cli, func(transport *http.Transport) http.RoundTripper {
+			return stealth.HTTP2Trans
+		}))
 	}
 
 	d.clientsMap = make(map[*http.Client]string)
@@ -1025,25 +1177,25 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 	for k, v := range advSettings.DomainRewrite {
 		lbData[k] = utils.RandChooseStr(v)
 	}
+	entry.Infof("Initiated loadBalanceData: %v", lbData)
 
 	clients := []*http.Client{
 		{
 			Transport: &http.Transport{
-				MaxIdleConnsPerHost:   2000,
-				IdleConnTimeout:       5 * time.Second,
+				MaxIdleConnsPerHost:   8000,
+				IdleConnTimeout:       14 * time.Second,
 				ResponseHeaderTimeout: 20 * time.Second,
 				TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 				DisableCompression:    true,
 				DisableKeepAlives:     false,
 				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 				DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-					if logger := ctx.Value("logger"); logger != nil {
-						logger.(*log.Entry).WithError(err).Debugf("Connecting %s %s", network, addr)
-					}
 					_addr := addr
 					if domain, ok := lbData[addr]; ok {
 						addr = domain
-						log.Tracef("Overrided %s to %s", _addr, addr)
+					}
+					if logger := ctx.Value("logger"); logger != nil {
+						logger.(*log.Entry).WithError(err).Tracef("Connecting %s %s with %s", network, _addr, addr)
 					}
 					return http.DefaultTransport.(*http.Transport).DialContext(ctx, network, addr)
 				},

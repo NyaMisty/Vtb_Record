@@ -7,6 +7,7 @@ import (
 	"github.com/fzxiao233/Vtb_Record/utils"
 	log "github.com/sirupsen/logrus"
 	re "github.com/umisama/go-regexpcache"
+	"golang.org/x/net/http2"
 	"math/rand"
 	"net"
 	"net/http"
@@ -15,9 +16,11 @@ import (
 	"time"
 )
 
+var HTTP2Trans *http2.Transport
+
 func SetupLoadBalance() {
-	http.DefaultTransport = &http.Transport{
-		MaxIdleConnsPerHost: 2000,
+	httpTrans := &http.Transport{
+		MaxIdleConnsPerHost: 8000,
 		DisableKeepAlives:   false, // disable keep alive to avoid connection reset
 		DisableCompression:  true,
 		IdleConnTimeout:     time.Second * 20,
@@ -72,9 +75,34 @@ func SetupLoadBalance() {
 					}).DialContext(ctx, network, addr)
 				}
 			}
-			return net.Dial(network, addr)
+			ret, err := net.Dial(network, addr)
+			if _ret, ok := ret.(*net.TCPConn); ok {
+				need := false
+				if strings.HasPrefix(addr, "10.") || strings.HasPrefix(addr, "192.") || strings.HasPrefix(addr, "127.") || strings.HasPrefix(addr, "172.1") {
+					need = true
+				} else if strings.Contains(addr, "google") {
+					need = true
+				} else if strings.Contains(addr, "gotcha104") {
+					need = true
+				}
+				_ret.SetNoDelay(need)
+				return _ret, err
+			}
+			return ret, err
 		},
 	}
+	http.DefaultTransport = httpTrans
+
+	HTTP2Trans = &http2.Transport{
+		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return httpTrans.DialContext(context.Background(), network, addr)
+		},
+		TLSClientConfig: httpTrans.TLSClientConfig,
+		AllowHTTP:       true,
+		ReadIdleTimeout: 5 * time.Second,
+		PingTimeout:     3 * time.Second,
+	}
+
 	if false {
 		dialer := &net.Dialer{
 			Timeout:   10 * time.Second,

@@ -128,7 +128,7 @@ func (p *ProcessVideo) startDownloadVideo() {
 				return
 			}
 			if panicMsg == "forceabort" {
-				logger.Warn("Downloader requested to abort! Waiting live to finish")
+				logger.Warn("Downloader requested to force abort! Waiting live to finish")
 				time.AfterFunc(2*time.Second, func() { // trigger a refresh now
 					defer func() {
 						recover()
@@ -172,7 +172,7 @@ func (p *ProcessVideo) startDownloadVideo() {
 				p.videoPathList = append(p.videoPathList, aFilePath)
 			} else {
 				failRecord = append(failRecord, time.Now())
-				logger.Info("Failed to record, trying to refresh live state!")
+				logger.Info("Failed to start record, trying to refresh live state!")
 
 				if len(failRecord) >= 3 {
 					if time.Now().Unix()-failRecord[0].Unix() < 30 {
@@ -216,7 +216,7 @@ func (p *ProcessVideo) keepLiveAlive() {
 		case _ = <-ticker.C:
 			//logger.Info("Refreshing live status...")
 		case _ = <-p.triggerChan:
-			logger.Info("Got emergency triggerChan signal, refresh at once!")
+			logger.Info("Got signal to refresh live status at once!")
 		}
 		if p.isNewLive() {
 			p.needStop = true
