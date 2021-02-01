@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strconv"
 )
 
 type LogWrapHook struct {
@@ -117,7 +118,7 @@ func InitLog() {
 
 	googleHook, err := sdhook.New(
 		sdhook.GoogleLoggingAgent(),
-		sdhook.LogName(Config.LogFile),
+		sdhook.LogName(Config.LogFile+strconv.Itoa(os.Getpid())),
 		sdhook.Levels(logrus.AllLevels[:logrus.DebugLevel+1]...),
 	)
 	if err != nil {

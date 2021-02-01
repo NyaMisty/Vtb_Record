@@ -161,17 +161,17 @@ func LevelStrParse(levelStr string) (level logrus.Level) {
 }
 
 func UpdateLogLevel() {
-	fs.Config.LogLevel = fs.LogLevelInfo
+	fs.GetConfig(nil).LogLevel = fs.LogLevelInfo
 	if Config.RLogLevel == "debug" {
-		fs.Config.LogLevel = fs.LogLevelDebug
+		fs.GetConfig(nil).LogLevel = fs.LogLevelDebug
 	} else if Config.RLogLevel == "info" {
-		fs.Config.LogLevel = fs.LogLevelInfo
+		fs.GetConfig(nil).LogLevel = fs.LogLevelInfo
 	} else if Config.RLogLevel == "warn" {
-		fs.Config.LogLevel = fs.LogLevelWarning
+		fs.GetConfig(nil).LogLevel = fs.LogLevelWarning
 	} else if Config.RLogLevel == "error" {
-		fs.Config.LogLevel = fs.LogLevelError
+		fs.GetConfig(nil).LogLevel = fs.LogLevelError
 	}
-	logrus.Printf("Set rclone logrus level to %s", fs.Config.LogLevel)
+	logrus.Printf("Set rclone logrus level to %s", fs.GetConfig(nil).LogLevel)
 
 	if ConsoleHook != nil {
 		if Config.LogLevel == "disable" {

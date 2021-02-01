@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/fzxiao233/Vtb_Record/config"
 	"github.com/fzxiao233/Vtb_Record/live"
@@ -47,7 +48,7 @@ func arrangeTask() {
 				}*/
 				if allDone {
 					time.Sleep(4 * time.Second) // wait to ensure the config is fully written
-					rconfig.LoadConfig()
+					rconfig.LoadConfig(context.Background())
 					ret, err := config.ReloadConfig()
 					if ret {
 						if err == nil {
@@ -125,7 +126,7 @@ func arrangeTask() {
 			break
 		}
 		log.Infof("Waiting to finish: current living %s", living)
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Second * 30)
 	}
 	log.Infof("All tasks finished! Wait an additional time to ensure everything's saved")
 	time.Sleep(time.Second * 300)
@@ -164,20 +165,20 @@ func handleUpdate() {
 func main() {
 	handleInterrupt()
 	handleUpdate()
-	fs.Config.StreamingUploadCutoff = fs.SizeSuffix(0)
-	fs.Config.IgnoreChecksum = true
-	fs.Config.NoGzip = true
+	fs.GetConfig(nil).StreamingUploadCutoff = fs.SizeSuffix(0)
+	fs.GetConfig(nil).IgnoreChecksum = true
+	fs.GetConfig(nil).NoGzip = true
 	rand.Seed(time.Now().UnixNano())
-	fs.Config.UserAgent = "google-api-go-client/0.5"
+	fs.GetConfig(nil).UserAgent = "google-api-go-client/0.5"
 
 	stealth.SetupLoadBalance()
 
-	fs.Config.Transfers = 20
-	fs.Config.ConnectTimeout = time.Second * 2
-	fs.Config.Timeout = time.Second * 4
-	fs.Config.TPSLimit = 0
-	fs.Config.LowLevelRetries = 120
-	//fs.Config.NoGzip = false
+	fs.GetConfig(nil).Transfers = 20
+	fs.GetConfig(nil).ConnectTimeout = time.Second * 2
+	fs.GetConfig(nil).Timeout = time.Second * 4
+	fs.GetConfig(nil).TPSLimit = 0
+	fs.GetConfig(nil).LowLevelRetries = 120
+	//fs.GetConfig(nil).NoGzip = false
 
 	// moved to config package
 	//confPath := flag.String("config", "config.json", "config.json location")

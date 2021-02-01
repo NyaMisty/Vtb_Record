@@ -164,50 +164,32 @@ func HttpPost(client *http.Client, url string, header map[string]string, data []
 	}
 }
 
-var totalSem = semaphore.NewWeighted(4200)
+var totalSem = semaphore.NewWeighted(2000)
 
-func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
+func HttpMultiDownload_old(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
 	startTime := time.Now()
 	var length int64 = 0
-	if false {
-		tempCli := CloneHttpClient(client, func(transport *http.Transport) http.RoundTripper {
-			transport.DisableKeepAlives = true
-			return transport
-		})
-		res, err := HttpDo(ctx, tempCli, meth, url, header, data)
-		if res != nil {
-			_ = res.Body.Close()
-		}
-		if err != nil {
-			return nil, err
-		}
-		if hdrs, ok := res.Header["Content-Length"]; ok {
-			if len(hdrs) != 0 {
-				length, err = strconv.ParseInt(hdrs[0], 10, 64)
-			}
-		}
-	} else {
-		newHdr := make(map[string]string)
-		for k, v := range header {
-			newHdr[k] = v
-		}
-		newHdr["Range"] = "bytes=0-0"
-		res, err := HttpDo(ctx, client, meth, url, newHdr, data)
-		if res != nil {
-			_, _ = io.CopyN(ioutil.Discard, res.Body, 2)
-			_ = res.Body.Close()
-		}
-		if err != nil {
-			return nil, err
-		}
-		if hdrs, ok := res.Header["Content-Range"]; ok {
-			if len(hdrs) != 0 {
-				if _tmp := strings.Split(hdrs[0], "/"); len(_tmp) == 2 {
-					length, err = strconv.ParseInt(_tmp[1], 10, 64)
-				}
+	newHdr := make(map[string]string)
+	for k, v := range header {
+		newHdr[k] = v
+	}
+	newHdr["Range"] = "bytes=0-0"
+	res, err := HttpDo(ctx, client, meth, url, newHdr, data)
+	if res != nil {
+		_, _ = io.CopyN(ioutil.Discard, res.Body, 2)
+		_ = res.Body.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hdrs, ok := res.Header["Content-Range"]; ok {
+		if len(hdrs) != 0 {
+			if _tmp := strings.Split(hdrs[0], "/"); len(_tmp) == 2 {
+				length, err = strconv.ParseInt(_tmp[1], 10, 64)
 			}
 		}
 	}
+
 	if length <= 0 {
 		return nil, fmt.Errorf("cannot get target file size")
 	}
@@ -331,20 +313,31 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 	return ret, retErr
 }
 
-func HttpMultiDownload1(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
-	res, err := HttpDo(ctx, client, meth, url, header, data)
+func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url string, header map[string]string, data []byte, chunkSize int64) ([]byte, error) {
+	startTime := time.Now()
+	var length int64 = 0
+	newHdr := make(map[string]string)
+	for k, v := range header {
+		newHdr[k] = v
+	}
+	newHdr["Range"] = "bytes=0-0"
+	res, err := HttpDo(ctx, client, meth, url, newHdr, data)
 	if res != nil {
+		_, _ = io.CopyN(ioutil.Discard, res.Body, 2)
 		_ = res.Body.Close()
 	}
 	if err != nil {
 		return nil, err
 	}
-	var length int64 = 0
-	if hdrs, ok := res.Header["Content-Length"]; ok {
+
+	if hdrs, ok := res.Header["Content-Range"]; ok {
 		if len(hdrs) != 0 {
-			length, err = strconv.ParseInt(hdrs[0], 10, 64)
+			if _tmp := strings.Split(hdrs[0], "/"); len(_tmp) == 2 {
+				length, err = strconv.ParseInt(_tmp[1], 10, 64)
+			}
 		}
 	}
+
 	if length <= 0 {
 		return nil, fmt.Errorf("cannot get target file size")
 	}
@@ -353,78 +346,158 @@ func HttpMultiDownload1(ctx context.Context, client *http.Client, meth, url stri
 	if thread == 0 {
 		thread = 1
 	}
-	if thread > 16 {
-		thread = 16
-	}
 
 	if length < chunkSize {
 		chunkSize = length
 	}
-	segTimeout := time.Second * 30
-	oriChunkSize := chunkSize
-	chunkSize = length / int64(thread)
-	if oriChunkSize == 0 {
-		oriChunkSize = chunkSize
-	}
-	segTimeout = time.Duration(chunkSize/oriChunkSize) * segTimeout
+	segTimeout := time.Second * 15
+
+	sem := semaphore.NewWeighted(7)
+
 	ret := make([]byte, length)
 	var wg sync.WaitGroup
 	var retErr error = nil
+
+	var errs []error
+	var downloadChunk func(min int64, max int64, i string)
+	downloadChunk = func(min int64, max int64, i string) {
+		defer wg.Done()
+
+		if time.Now().Sub(startTime) > 120*time.Second {
+			//log.Warnf("Failed to download chunk %d for %s, errors: %v", i, url, errs)
+			retErr = fmt.Errorf("download chunk %s(%d-%d) for %s failed, errors: %v", i, min, max, url, errs)
+			return
+		}
+
+		//startWait := time.Now()
+		// rate limit
+		if err := totalSem.Acquire(ctx, 1); err == nil {
+			defer totalSem.Release(1)
+		}
+		if err := sem.Acquire(ctx, 1); err == nil {
+			defer sem.Release(1)
+		} else {
+			retErr = fmt.Errorf("failed to acquire sem, err: %v", err)
+			return
+		}
+
+		/*if logger := ctx.Value("logger"); logger != nil {
+			logger.(*log.Entry).WithError(err).Debugf("Waited %v for chunk %s(%d-%d)", time.Now().Sub(startWait), i, min, max)
+		}*/
+
+		// prepare range header
+		curHdr := make(map[string]string)
+		for k, v := range header {
+			curHdr[k] = v
+		}
+		var bytesrange string
+		if max != -1 {
+			bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-" + strconv.FormatInt(max-1, 10)
+		} else {
+			bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-"
+		}
+		curHdr["Range"] = bytesrange
+
+		curCtx, _ := context.WithTimeout(ctx, segTimeout)
+		res, err := HttpDo(curCtx, client, meth, url, curHdr, data)
+		if err == nil && res.StatusCode != 206 {
+			err = fmt.Errorf("unknown status code %d for multi-down, hdrs: %v", res.StatusCode, curHdr)
+		}
+		if err != nil && strings.Contains(err.Error(), "HttpGet status error") {
+			retErr = err
+			return
+		}
+
+		readed := -1
+		if err == nil {
+			if retRange := res.Header.Get("Content-Range"); retRange != "" {
+				if rangeParsed := strings.Split(retRange, "/"); len(rangeParsed) == 2 {
+					if fullLen, err := strconv.ParseInt(rangeParsed[1], 10, 64); err == nil {
+						if fullLen != length {
+							err = fmt.Errorf("full length changed from %v to %v, aborting", length, fullLen)
+						}
+					} else {
+						err = fmt.Errorf("failed to parse Content-Range: cannot parse full length %v, error %s", rangeParsed[1], err)
+					}
+				} else {
+					err = fmt.Errorf("failed to parse Content-Range: invalid range: %s", retRange)
+				}
+			} else {
+				err = fmt.Errorf("missing Content-Range in response")
+			}
+			if err != nil { // invalid return format, fail at once
+				retErr = err
+				return
+			}
+			targetSlice := ret[min:]
+			if max != -1 {
+				targetSlice = ret[min:max]
+			}
+			readed, err = io.ReadFull(res.Body, targetSlice)
+			if readed != -1 {
+				min += int64(readed)
+			}
+		}
+		if res != nil {
+			_ = res.Body.Close()
+		}
+
+		if err != nil {
+			/*if logger := ctx.Value("logger"); logger != nil {
+				logger.(*log.Entry).WithError(err).Debugf("Failed to download chunk %d for %s", i, url)
+			}*/
+			time.Sleep(time.Second * 2)
+			errs = append(errs, err)
+			if readed != -1 && (max != -1 && max-min >= 2 && max-min > 50*1024) {
+				wg.Add(2)
+				mid := (max + min) / 2
+				go downloadChunk(min, mid, i+"-1")
+				go downloadChunk(mid, max, i+"-2")
+			} else {
+				wg.Add(1)
+				go downloadChunk(min, max, i)
+			}
+		}
+	}
 
 	for i := 0; i < thread; i++ {
 		wg.Add(1)
 		min := chunkSize * int64(i)   // Min range
 		max := chunkSize * int64(i+1) // Max range
 		if i == thread-1 {
-			max = -1
+			max = length
 		}
-		go func(min int64, max int64, i int) {
-			curTime := 0
-			errs := make([]error, 0)
-			for {
-				if curTime > 4 {
-					//log.Warnf("Failed to download chunk %d for %s, errors: %v", i, url, errs)
-					retErr = fmt.Errorf("download chunk %d for %s failed, errors: %v", i, url, errs)
-					break
-				}
-				curTime++
-				curHdr := make(map[string]string)
-				for k, v := range header {
-					curHdr[k] = v
-				}
-				var bytesrange string
-				if max != -1 {
-					bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-" + strconv.FormatInt(max-1, 10)
-				} else {
-					bytesrange = "bytes=" + strconv.FormatInt(min, 10) + "-"
-				}
 
-				curHdr["Range"] = bytesrange
-				curCtx, _ := context.WithTimeout(ctx, segTimeout)
-				res, err = HttpDo(curCtx, client, meth, url, curHdr, data)
+		go downloadChunk(min, max, strconv.Itoa(i))
+	}
 
-				if err == nil {
-					targetSlice := ret[min:]
-					if max != -1 {
-						targetSlice = ret[min:max]
-					}
-					_, err = io.ReadFull(res.Body, targetSlice)
-				}
-				if res != nil {
-					_ = res.Body.Close()
-				}
+	waitCh := make(chan struct{})
+	go func() {
+		// Run some actions
+		wg.Wait()
+		close(waitCh)
+	}()
 
-				if err != nil {
-					//log.WithError(err).Debugf("Failed to download chunk %d for %s", i, url)
-					//time.Sleep(time.Second * 2)
-					errs = append(errs, err)
-					continue
-				}
+	fin := false
+	errCh := make(chan struct{})
+	go func() {
+		for {
+			if retErr != nil {
+				close(errCh)
 				break
 			}
-			wg.Done()
-		}(min, max, i)
+			if fin {
+				break
+			}
+			time.Sleep(time.Second * 2)
+		}
+	}()
+
+	select {
+	case <-waitCh:
+		fin = true
+		return ret, retErr
+	case <-errCh:
+		return ret, retErr
 	}
-	wg.Wait()
-	return ret, retErr
 }

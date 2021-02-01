@@ -15,8 +15,9 @@ import (
 	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 	"github.com/valyala/bytebufferpool"
+	"go.uber.org/atomic"
+	"go.uber.org/ratelimit"
 	"golang.org/x/net/http2"
-	"golang.org/x/sync/semaphore"
 	"io"
 	"math"
 	"math/rand"
@@ -24,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +33,10 @@ import (
 )
 
 type HLSSegment struct {
+	SegContext    context.Context
+	SegConCancel  func()
 	SegNo         int
+	SegLen        float64
 	SegArriveTime time.Time
 	Url           string
 	//Data          []byte
@@ -39,6 +44,7 @@ type HLSSegment struct {
 }
 
 type HLSDownloader struct {
+	Context            context.Context
 	Logger             *log.Entry
 	M3U8UrlRewriter    stealth.URLRewriter
 	GeneralUrlRewriter stealth.URLRewriter
@@ -64,15 +70,20 @@ type HLSDownloader struct {
 
 	SeqMap     sync.Map
 	AltSeqMap  *lru.Cache
-	SegLen     float64
 	FinishSeq  int
-	lastSeqNo  int
 	Stopped    bool
 	AltStopped bool
 	output     io.Writer
-	//segRl      ratelimit.Limiter
-	segLens *ring.Ring
-	segRl   *semaphore.Weighted
+
+	lastSeqNo      int
+	lastWriteSeqNo int
+	writeLagNum    atomic.Int64
+	segLens        *ring.Ring
+	SegLen         float64
+
+	rl          ratelimit.Limiter
+	segRl       *utils.PrioritySemaphore
+	downloading atomic.Int64
 
 	firstSeqChan chan int
 	hasAlt       bool
@@ -124,6 +135,7 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 	})
 
 	round := 0
+	rets := make([]string, 0)
 	for {
 		round += 1
 		var res *http.Response
@@ -133,58 +145,113 @@ func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bo
 			newHdr[k] = v
 		}
 		newHdr["Range"] = fmt.Sprintf("bytes=%d-", 2147483645)
-		doReq := func() *http.Response {
-			req, _ := utils.HttpBuildRequest(con, "GET", segData.Url, newHdr, nil)
+		doReq := func() (*http.Response, error) {
+			req, err := utils.HttpBuildRequest(con, "GET", segData.Url, newHdr, nil)
 			if req == nil {
-				logger.Warnf("Failed to peek due to build request failed!")
-				return nil
+				return nil, err
 			}
 			//req.Close = true
-			res, _ = utils.HttpDoRequest(con, tempCli, req)
+			res, err = utils.HttpDoRequest(con, tempCli, req)
 			if res == nil {
-				return nil
+				return nil, err
 			}
 			tempbuf := make([]byte, 4)
 			_, _ = res.Body.Read(tempbuf)
 			_ = res.Body.Close()
-			return res
+			return res, nil
 		}
-		res = doReq()
-		if res == nil {
-			time.Sleep(time.Second * 4)
-			continue
+		res, err := doReq()
+		if res != nil {
+			rets = append(rets, fmt.Sprintf("'status:%v'", res.StatusCode))
+			if res.StatusCode == 416 {
+				logger.Debugf("Successfully peeked segment %d in %v, rets: %v", segData.SegNo, time.Now().Sub(startTime), rets)
+				//newHdr["Range"] = fmt.Sprintf("bytes=1-1,409601-409601,819201-819201,1228801-1882201,1638400-1638401," +
+				//	"2048000-2048001,3072000-3072001,3584000-3584001,4096000-4096001")
+				//doReq()
+				return true
+			}
+			if res.StatusCode != 200 && res.StatusCode != 206 {
+				logger.Warnf("Failed to peek segment %d due to unknown status code %d: %s", segData.SegNo, res.StatusCode, segData.Url)
+				return false
+			}
+		} else {
+			rets = append(rets, fmt.Sprintf("'err:%v'", err))
 		}
 
-		if res.StatusCode == 416 {
-			logger.Debugf("Successfully peeked segment %d in %v", segData.SegNo, time.Now().Sub(startTime))
-			newHdr["Range"] = fmt.Sprintf("bytes=1-1,409601-409601,819201-819201,1228801-1882201,1638400-1638401," +
-				"2048000-2048001,3072000-3072001,3584000-3584001,4096000-4096001")
-			doReq()
-			return true
-		}
-		if res.StatusCode != 200 && res.StatusCode != 206 {
-			logger.Warnf("Failed to peek due to unknown status code %d: %s", res.StatusCode, segData.Url)
-			return false
-		}
 		time.Sleep(time.Second * 5)
-		if round > 30 {
-			logger.Warnf("Failed to peek within timeout: %s", segData.Url)
+		if round > 8 {
+			logger.Warnf("Failed to peek segment %d within timeout: %s, rets: %v", segData.SegNo, segData.Url, rets)
 			return false
 		}
 	}
 }
 
+var SEG_DOWNLOAD_START_DDL = 80 * time.Second
+var SEG_DOWNLOAD_TIMEOUT = 150 * time.Second
+
 func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 	logger := d.Logger.WithField("alt", false)
 	startTime := time.Now()
 
-	if err := d.segRl.Acquire(context.Background(), 1); err == nil {
-		defer d.segRl.Release(1)
+	var released atomic.Int64
+	released.Inc()
+	curPrio := segData.SegArriveTime.Unix()*1000000 + int64(segData.SegNo)%1000000
+	for i := 0; i < 25 && time.Now().Sub(segData.SegArriveTime) < SEG_DOWNLOAD_START_DDL-5*time.Second; i++ {
+		if segData.SegNo-d.lastWriteSeqNo > 5 {
+			time.Sleep(1000 * time.Millisecond)
+		} else {
+			break
+		}
+	}
+	semCon, _ := context.WithDeadline(segData.SegContext, segData.SegArriveTime.Add(SEG_DOWNLOAD_START_DDL))
+	if err := d.segRl.Acquire(semCon, -curPrio); err == nil {
+		if strings.Contains(d.HLSUrl, "gotcha105") {
+			for i := 0; i < 12 && time.Now().Sub(segData.SegArriveTime) < SEG_DOWNLOAD_START_DDL; i++ {
+				if segData.SegNo-d.lastWriteSeqNo > 5 {
+					time.Sleep(1000 * time.Millisecond)
+				} else {
+					break
+				}
+			}
+			go func() {
+				if d.downloading.Load() >= 4 { // too many downloading
+					return
+				}
+				if segData.SegNo-d.lastWriteSeqNo > 5 { // we are already over ahead, do not make it worse
+					return
+				}
+				/*if d.lastSeqNo > segData.SegNo {
+					laggedTime := time.Duration(segData.SegLen * float64(time.Second)) * time.Duration(d.lastSeqNo - segData.SegNo)
+					deadline := 90 * time.Second - laggedTime
+					if deadline > 0 {
+						time.Sleep(deadline)
+					}
+				}*/
+				time.Sleep(time.Duration(d.SegLen * float64(time.Second) * 2))
+				relCount := released.Dec() + 1
+				if relCount > 0 {
+					d.segRl.Release()
+				}
+			}()
+		}
+		defer func() {
+			relCount := released.Dec() + 1
+			if relCount > 0 {
+				d.segRl.Release()
+			}
+		}()
+	}
+	if err := segData.SegContext.Err(); err != nil {
+		logger.Infof("Not downloading seg %d because segCon canceled, err: %v", segData.SegNo, err)
+		return false
 	}
 	if d.Stopped {
 		return false
 	}
+	d.downloading.Inc()
+	defer d.downloading.Dec()
 
+	beginTime := time.Now()
 	finished := false
 	// download using a client
 	downChan := make(chan *bytes.Buffer)
@@ -194,7 +261,12 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 		}()
 		close(downChan)
 	}()
+	var downloadCount atomic.Int32
 	doDownload := func(con context.Context, client *http.Client) bool {
+		downloadCount.Inc()
+		defer func() {
+			downloadCount.Dec()
+		}()
 		s := time.Now()
 		clientType, ok := d.clientsMap[client]
 		if !ok {
@@ -214,6 +286,8 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 		if err != nil {
 			if !finished {
 				logger.WithError(err).Infof("Err when download segment %s with %s client", segData.Url, clientType)
+			} else {
+				logger.WithError(err).Debugf("Err when download segment %s with %s client", segData.Url, clientType)
 			}
 			// if it's 404, then we'll never be able to download it later, stop the useless retry
 			if strings.HasSuffix(err.Error(), "404") {
@@ -230,10 +304,12 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 			}
 		} else {
 			usedTime := time.Now().Sub(s)
+			dolog := logger.Debugf
 			if usedTime > time.Second*39 {
 				// we used too much time to download a segment
-				logger.Infof("Download %d used %s with %s client (%s)", segData.SegNo, usedTime, clientType, segData.Url)
+				dolog = logger.Infof
 			}
+			dolog("Download %d used %s with %s client (%s)", segData.SegNo, usedTime, clientType, segData.Url)
 			func() {
 				defer func() {
 					recover()
@@ -271,14 +347,68 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 	// we one by one use each clients to download the segment, the first returned downloader wins
 	// normally each hls seg will exist for 1 minutes
 	round := 0
-	curCon, curConCancel := context.WithCancel(context.Background())
+	curCon, curConCancel := context.WithCancel(segData.SegContext)
 	curCon = context.WithValue(curCon, "logger", logger)
 	defer curConCancel()
+
+	var retryChan chan int
+	defer func() {
+		if retryChan != nil {
+			ch := retryChan
+			retryChan = nil
+			close(ch)
+		}
+	}()
 breakout:
 	for {
 		i %= len(clients)
 		go doDownload(curCon, clients[i])
 		i += 1
+
+		if retryChan != nil {
+			ch := retryChan
+			retryChan = nil
+			close(ch)
+		}
+		retryChan = make(chan int)
+		if strings.Contains(segData.Url, "gotcha105") {
+			// do nothing and wait until last one finished
+			go func(ch chan int) {
+				defer func() {
+					recover()
+				}()
+				tch := time.After(time.Second * 60)
+				time.Sleep(6 * time.Second)
+
+			breakout:
+				for {
+					select {
+					case <-tch:
+						if downloadCount.Load() <= 1 {
+							ch <- 1
+							break breakout
+						}
+					default:
+					}
+					if downloadCount.Load() > 0 {
+						time.Sleep(2 * time.Second)
+						continue
+					}
+					ch <- 1
+					break
+				}
+			}(retryChan)
+		} else {
+			go func(ch chan int) {
+				defer func() {
+					recover()
+				}()
+				time.Sleep(6 * time.Second)
+				<-time.After(45 * time.Second)
+				ch <- 1
+			}(retryChan)
+		}
+
 		select {
 		case ret := <-downChan:
 			close(downChan)
@@ -287,27 +417,31 @@ breakout:
 			}
 			segData.Data = ret
 			break breakout
-		case <-time.After(60 * time.Second):
+		case <-retryChan:
 			// wait 10 second for each download try
-			logger.Infof("Retrying seg %d download, last round %d client %d", segData.SegNo, round, i-1)
 		}
+		if time.Now().Sub(segData.SegArriveTime) > SEG_DOWNLOAD_TIMEOUT {
+			logger.Warnf("Failed to download segment %d within timeout...", segData.SegNo)
+			return false
+		}
+		if curCon.Err() != nil {
+			logger.Warnf("Cancelling download segment %d (%s) because %v", segData.SegNo, segData.Url, curCon.Err())
+			return false
+		}
+		logger.Infof("Retrying seg %d download, last round %d client %d", segData.SegNo, round, i-1)
 		if i == len(clients) {
 			logger.Warnf("Failed all-clients to download segment %d (%s)", segData.SegNo, segData.Url)
 			round++
 		}
-		if time.Now().Sub(segData.SegArriveTime) > 240*time.Second {
-			logger.Warnf("Failed to download segment %d within timeout...", segData.SegNo)
-			return false
-		}
 	}
+	dolog := logger.Debugf
 	if round > 0 {
 		// log the too long seg download and alt seg download
-		logger.Infof("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
-	} else {
-		//logger.Debugf("Downloaded segment %d (%s): len %v client %d using %v", segData.SegNo, segData.Url, segData.Data.Len(), i, time.Now().Sub(startTime))
-		logger.Debugf("Downloaded segment %d: len %v client %d using %v", segData.SegNo, segData.Data.Len(), i, time.Now().Sub(startTime))
+		dolog = logger.Infof
 	}
+	dolog("Downloaded segment %d: len %v client %d using %v (wait %v)", segData.SegNo, segData.Data.Len(), i, time.Now().Sub(beginTime), beginTime.Sub(startTime))
 	finished = true
+	d.writeLagNum.Inc()
 	return true
 }
 
@@ -322,9 +456,9 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 	//logger := d.Logger.WithField("alt", false)
 
 	if strings.Contains(segData.Url, "gotcha105") {
-		PEEK_TIME := time.Second * 110
+		PEEK_TIME := SEG_DOWNLOAD_START_DDL - 30*time.Second
 		PEEK_NUMBER := 1
-		con, concancel := context.WithTimeout(context.Background(), PEEK_TIME)
+		con, concancel := context.WithTimeout(segData.SegContext, PEEK_TIME)
 		//peekChan := make(chan int)
 		for i := 0; i < PEEK_NUMBER; i++ {
 			// peek it first!
@@ -333,11 +467,12 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 					peekChan <- 1
 				}
 			}()*/
+			peekStart := time.Now()
 			if d.peekSegment(con, segData) {
 				concancel()
 				break
 			}
-			time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
+			time.Sleep(PEEK_TIME/time.Duration(PEEK_NUMBER) - time.Now().Sub(peekStart))
 		}
 		<-con.Done()
 		time.Sleep(10 * time.Second)
@@ -406,8 +541,10 @@ func (d *HLSDownloader) m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) 
 			seg_i += 1
 			segs = append(segs, item.Segment)
 
+			con, concancel := context.WithCancel(d.Context)
+			segItem := &HLSSegment{SegContext: con, SegConCancel: concancel, SegNo: seqNo, SegLen: item.Duration, SegArriveTime: time.Now(), Url: getSegUrl(item.Segment)}
 			if !isAlt {
-				_segData, loaded := d.SeqMap.LoadOrStore(seqNo, &HLSSegment{SegNo: seqNo, SegArriveTime: time.Now(), Url: getSegUrl(item.Segment)})
+				_segData, loaded := d.SeqMap.LoadOrStore(seqNo, segItem)
 				if !loaded {
 					// update seglen
 					d.segLens.Value = item.Duration
@@ -432,7 +569,7 @@ func (d *HLSDownloader) m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) 
 					go d.handleSegment(segData)
 				}
 			} else {
-				d.AltSeqMap.PeekOrAdd(seqNo, &HLSSegment{SegNo: seqNo, SegArriveTime: time.Now(), Url: getSegUrl(item.Segment)})
+				d.AltSeqMap.PeekOrAdd(seqNo, segItem)
 			}
 		}
 	}
@@ -441,7 +578,7 @@ func (d *HLSDownloader) m3u8Parser(parsedurl *url.URL, m3u8 string, isAlt bool) 
 		d.firstSeqChan = nil
 	}
 	if !isAlt {
-		d.lastSeqNo = curseq + len(segs)
+		d.lastSeqNo = curseq + len(segs) - 1
 	}
 	if !playlist.IsLive() {
 		d.FinishSeq = curseq + len(segs) - 1
@@ -717,6 +854,7 @@ func (d *HLSDownloader) refreshClient() {
 	for _, cli := range d.h2Clients {
 		cli.CloseIdleConnections()
 	}
+	initLBData(d.loadBalanceData)
 }
 
 // query main m3u8 every 2 seconds
@@ -746,7 +884,7 @@ func (d *HLSDownloader) Downloader() {
 			break
 		}
 		lastUpdate := time.Now().Sub(lastHandleTime)
-		if time.Now().Sub(lastHandleTime) > time.Duration(float64(time.Second)*1.5*d.SegLen) {
+		if time.Now().Sub(lastHandleTime) > time.Duration(float64(time.Second)*1.2*d.SegLen) {
 			d.Logger.Infof("Detected potential lag (%v since last update)! Retrying at once!", lastUpdate)
 			lastHandleTime = time.Now()
 			d.refreshClient()
@@ -758,8 +896,8 @@ func (d *HLSDownloader) Downloader() {
 		if d.SegLen < curDuration {
 			if ret := curDuration - d.SegLen; ret/d.SegLen > 0.18 && ret > 0.6 {
 				newDuration = (d.SegLen + curDuration) / 2
-				if newDuration < 1.0 {
-					newDuration = 1.0
+				if newDuration < 1.2 {
+					newDuration = 1.2
 				}
 				d.Logger.Infof("Using new hls interval: %f", newDuration*0.8)
 			}
@@ -769,8 +907,8 @@ func (d *HLSDownloader) Downloader() {
 				shakeCount += 1
 				if shakeCount >= 3 { // segLen are more keen to go lower
 					newDuration = (d.SegLen + curDuration) / 2
-					if newDuration < 1.0 {
-						newDuration = 1.0
+					if newDuration < 1.2 {
+						newDuration = 1.2
 					}
 				}
 			} else {
@@ -780,8 +918,8 @@ func (d *HLSDownloader) Downloader() {
 		if newDuration != curDuration {
 			ticker.Stop()
 			curDuration = newDuration
-			d.Logger.Infof("Using new hls interval: %f", curDuration*0.8)
-			ticker = time.NewTicker(time.Duration(float64(time.Second) * curDuration * 0.8))
+			d.Logger.Infof("Using new hls interval: %f", curDuration*0.7)
+			ticker = time.NewTicker(time.Duration(float64(time.Second) * curDuration * 0.7))
 		}
 	}
 	ticker.Stop()
@@ -803,6 +941,7 @@ func (d *HLSDownloader) Worker() {
 
 			case _ = <-d.forceRefreshChan:
 				d.Logger.Info("Got forceRefresh signal, refresh at once!")
+				d.refreshClient()
 				isClose := false
 				func() {
 					defer func() {
@@ -881,6 +1020,191 @@ func (d *HLSDownloader) WriterStub() {
 }
 
 // Responsible to write out each segments
+//func (d *HLSDownloader) Writer_old() {
+//	getMinNo := func() int {
+//		minNo := -1
+//		d.SeqMap.Range(func(key, value interface{}) bool {
+//			cur := key.(int)
+//			if minNo == -1 {
+//				minNo = cur
+//			}
+//			if key.(int) < minNo {
+//				minNo = cur
+//			}
+//			return true
+//		})
+//		return minNo
+//	}
+//	getMinNo()
+//
+//	lastArrivalTime := time.Now()
+//
+//	writeSeg := func(curSeq int, val *HLSSegment) {
+//		timeoutChan := make(chan int, 1)
+//		go func(timeoutChan chan int, startTime time.Time, segNo int) {
+//			// detect writing timeout
+//			timer := time.NewTimer(15 * time.Second)
+//			select {
+//			case <-timeoutChan:
+//				d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
+//			case <-timer.C:
+//				d.Logger.Warnf("Write segment %d too slow...", curSeq)
+//				timer2 := time.NewTimer(60 * time.Second)
+//				select {
+//				case <-timeoutChan:
+//					d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
+//				case <-timer2.C:
+//					d.Logger.Errorf("Write segment %d timeout!!!!!!!", curSeq)
+//				}
+//			}
+//		}(timeoutChan, time.Now(), curSeq)
+//		_, err := d.output.Write(val.Data.Bytes())
+//		timeoutChan <- 1
+//
+//		//bufPool.Put(val.Data)
+//		val.Data = nil
+//		if err != nil {
+//			d.sendErr(err)
+//			return
+//		}
+//	}
+//
+//	// get the seq of first segment, then start the writing
+//	curSeq := <-d.firstSeqChan
+//	for {
+//		// calculate the load time, so that we can check the timeout
+//		loadTime := time.Second * 0
+//		//d.Logger.Debugf("Loading segment %d", curSeq)
+//		for {
+//			_val, ok := d.SeqMap.Load(curSeq)
+//			if ok {
+//				// the segment has already been retrieved
+//				val := _val.(*HLSSegment)
+//
+//				if val.Data != nil {
+//					// segment has been downloaded
+//					if curSeq >= 60 {
+//						d.SeqMap.Range(func(key, value interface{}) bool {
+//							if key.(int) <= curSeq-20 && value.(*HLSSegment).SegArriveTime.Before(time.Now().Add(- time.Second * 180)) {
+//								d.SeqMap.Delete(key.(int))
+//							}
+//							return true
+//						})
+//					}
+//					lastArrivalTime = val.SegArriveTime
+//					writeSeg(curSeq, val)
+//					break
+//				}
+//				// segment still not downloaded, increase the load time
+//			} else {
+//				if loadTime > 20*time.Second {
+//					// segment is not loaded
+//					{
+//						// detect seqNo got reset to 1
+//						minNo := 2147483647
+//						d.SeqMap.Range(func(key, value interface{}) bool {
+//							if value.(*HLSSegment).SegArriveTime.After(lastArrivalTime) {
+//								if key.(int) < minNo {
+//									minNo = key.(int)
+//								}
+//							}
+//							return true
+//						})
+//						reset := false
+//						if _minSeg, ok := d.SeqMap.Load(minNo); ok {
+//							minSeg := _minSeg.(*HLSSegment)
+//							if minSeg.SegArriveTime.Sub(lastArrivalTime) < 15 * time.Second {
+//								reset = true
+//							}
+//						}
+//						if (d.lastSeqNo >= 3 && d.lastSeqNo+30 < curSeq) {
+//							reset = true
+//						}
+//						if reset && minNo != 2147483647 {
+//							hasLargerId := false
+//							/*
+//							d.SeqMap.Range(func(key, value interface{}) bool {
+//								if key.(int) > curSeq {
+//									hasLargerId = true
+//									return false
+//								} else {
+//									return true
+//								}
+//							})*/
+//							if !hasLargerId {
+//								d.Logger.Warnf("Failed to load segment %d due to segNo got reset to %d", curSeq, minNo)
+//								curSeq = minNo
+//								continue
+//								// exit ASAP so that alt stream will be preserved
+//								//d.sendErr(fmt.Errorf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo))
+//								//return
+//							} else {
+//								// fall into lag check instead
+//							}
+//						}
+//					}
+//
+//					{
+//						// detect if we are lagged (e.g. we are currently at seg2, still waiting for seg3 to appear, however seg4 5 6 7 has already been downloaded)
+//						isLagged := false
+//						d.SeqMap.Range(func(key, value interface{}) bool {
+//							if key.(int) > curSeq+4 && value.(*HLSSegment).Data != nil {
+//								d.Logger.Warnf("curSeq %d lags behind segData %d!", curSeq, key.(int))
+//								isLagged = true
+//								return false
+//							} else {
+//								return true
+//							}
+//						})
+//						if isLagged { // exit ASAP so that alt stream will be preserved
+//							//d.sendErr(fmt.Errorf("Failed to load segment %d within m3u8 timeout due to lag...", curSeq))
+//							nextSeq := 2147483647
+//							d.SeqMap.Range(func(key, value interface{}) bool {
+//								if key.(int) > curSeq && key.(int) < nextSeq {
+//									nextSeq = key.(int)
+//								}
+//								return true
+//							})
+//							d.Logger.Warnf("Failed to load segment %d within m3u8 timeout due to lag, continuing to next seg %d", curSeq, nextSeq)
+//							curSeq = nextSeq
+//							continue
+//						}
+//					}
+//				}
+//			}
+//			time.Sleep(500 * time.Millisecond)
+//			loadTime += 500 * time.Millisecond
+//			// if load time is too long, then likely the recording is interrupted
+//			if loadTime == 1*time.Minute || loadTime == 150*time.Second || loadTime == 240*time.Second {
+//				//go d.AltSegDownloader() // trigger alt download in advance, so we can avoid more loss
+//			}
+//			if loadTime > 2*time.Minute { // segNo shouldn't return to 0 within 5 min
+//				// if we come to here, then the lag detect would already failed, the live must be interrupted
+//				newSeq := 2147483647
+//				d.SeqMap.Range(func(key, value interface{}) bool {
+//					if key.(int) > curSeq && key.(int) < newSeq {
+//						newSeq = key.(int)
+//					}
+//					return true
+//				})
+//				if newSeq != 2147483647 {
+//					d.Logger.Warnf("Failed to load segment %d within timeout, continuing to segment %d", curSeq, newSeq)
+//					curSeq = newSeq
+//					continue
+//				} else {
+//					d.sendErr(fmt.Errorf("Failed to load segment %d within timeout...", curSeq))
+//					return
+//				}
+//			}
+//			if curSeq == d.FinishSeq { // successfully finished
+//				d.sendErr(nil)
+//				return
+//			}
+//		}
+//		curSeq += 1
+//	}
+//}
+
 func (d *HLSDownloader) Writer() {
 	getMinNo := func() int {
 		minNo := -1
@@ -896,7 +1220,97 @@ func (d *HLSDownloader) Writer() {
 		})
 		return minNo
 	}
+	getMinNo()
 
+	writeSeg := func(curSeq int, val *HLSSegment) bool {
+		timeoutChan := make(chan int, 1)
+		go func(timeoutChan chan int, startTime time.Time, segNo int) {
+			// detect writing timeout
+			timer := time.NewTimer(15 * time.Second)
+			select {
+			case <-timeoutChan:
+				d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
+			case <-timer.C:
+				d.Logger.Warnf("Write segment %d too slow...", curSeq)
+				timer2 := time.NewTimer(60 * time.Second)
+				select {
+				case <-timeoutChan:
+					d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
+				case <-timer2.C:
+					d.Logger.Errorf("Write segment %d timeout!!!!!!!", curSeq)
+				}
+			}
+		}(timeoutChan, time.Now(), curSeq)
+		_, err := d.output.Write(val.Data.Bytes())
+		d.writeLagNum.Dec()
+		d.lastWriteSeqNo = curSeq
+		timeoutChan <- 1
+
+		//bufPool.Put(val.Data)
+		val.Data = nil
+		if err != nil {
+			d.sendErr(err)
+			return false
+		}
+		return true
+	}
+
+	/*type WriteSegReq struct {
+		curSeq		int
+		val			*HLSSegment
+	}
+	segChan := make(chan WriteSegReq, 10)
+	defer close(segChan)
+	go func() {
+		for {
+			segWrite := <-segChan
+			if segWrite.curSeq == 0 && segWrite.val == nil { // chan closed
+				break
+			}
+			writeSeg(segWrite.curSeq, segWrite.val)
+		}
+	}()*/
+
+	type LoadStatus int32
+	const (
+		WRITE_FAILED  LoadStatus = 3
+		LOAD_FINISHED LoadStatus = 2
+		DOWNLOAD_WAIT LoadStatus = 1
+		WAIT_SEG      LoadStatus = 0
+	)
+
+	lastArrivalTime := time.Now().Add(-200 * time.Second)
+	doLoad := func(curSeq int) LoadStatus {
+		_val, ok := d.SeqMap.Load(curSeq)
+		if ok {
+			// the segment has already been retrieved
+			val := _val.(*HLSSegment)
+
+			if val.Data != nil {
+				// segment has been downloaded
+				if curSeq >= 60 {
+					d.SeqMap.Range(func(key, value interface{}) bool {
+						// delete old entry, but preserve reseted seg & recently segs (so that seg won't be reload)
+						if key.(int) <= curSeq-20 && value.(*HLSSegment).SegArriveTime.Before(time.Now().Add(-time.Second*180)) {
+							d.SeqMap.Delete(key.(int))
+						}
+						return true
+					})
+				}
+				lastArrivalTime = val.SegArriveTime
+				//segChan <- WriteSegReq{curSeq, val}
+				if writeSeg(curSeq, val) {
+					return LOAD_FINISHED
+				} else {
+					return WRITE_FAILED
+				}
+			}
+			// segment still not downloaded, increase the load time
+			return DOWNLOAD_WAIT
+		} else {
+			return WAIT_SEG
+		}
+	}
 	// get the seq of first segment, then start the writing
 	curSeq := <-d.firstSeqChan
 	for {
@@ -904,107 +1318,48 @@ func (d *HLSDownloader) Writer() {
 		loadTime := time.Second * 0
 		//d.Logger.Debugf("Loading segment %d", curSeq)
 		for {
-			_val, ok := d.SeqMap.Load(curSeq)
-			if ok {
-				// the segment has already been retrieved
-				val := _val.(*HLSSegment)
-				if curSeq >= 60 {
-					d.SeqMap.Range(func(key, value interface{}) bool {
-						if key.(int) <= curSeq-60 {
-							d.SeqMap.Delete(curSeq - 60)
-						}
-						return true
-					})
-				}
-
-				if val.Data != nil {
-					// segment has been downloaded
-					timeoutChan := make(chan int, 1)
-					go func(timeoutChan chan int, startTime time.Time, segNo int) {
-						// detect writing timeout
-						timer := time.NewTimer(15 * time.Second)
-						select {
-						case <-timeoutChan:
-							d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
-						case <-timer.C:
-							d.Logger.Warnf("Write segment %d too slow...", curSeq)
-							timer2 := time.NewTimer(60 * time.Second)
-							select {
-							case <-timeoutChan:
-								d.Logger.Debugf("Wrote segment %d in %s", segNo, time.Now().Sub(startTime))
-							case <-timer2.C:
-								d.Logger.Errorf("Write segment %d timeout!!!!!!!", curSeq)
-							}
-						}
-					}(timeoutChan, time.Now(), curSeq)
-					_, err := d.output.Write(val.Data.Bytes())
-					timeoutChan <- 1
-
-					//bufPool.Put(val.Data)
-					val.Data = nil
-					if err != nil {
-						d.sendErr(err)
-						return
+			segChoices := make([]*HLSSegment, 0)
+			{
+				// add possible segs
+				d.SeqMap.Range(func(key, value interface{}) bool {
+					val := value.(*HLSSegment)
+					if val.SegArriveTime.After(lastArrivalTime) {
+						segChoices = append(segChoices, val)
 					}
-					break
+					return true
+				})
+			}
+			sort.Slice(segChoices, func(i, j int) bool {
+				if segChoices[i].SegArriveTime.Equal(segChoices[j].SegArriveTime) {
+					return segChoices[i].SegNo < segChoices[j].SegNo
 				}
-				// segment still not downloaded, increase the load time
+				return segChoices[i].SegArriveTime.Before(segChoices[j].SegArriveTime)
+			})
+			nextSeq := -1
+			if len(segChoices) == 0 {
+				nextSeq = curSeq
 			} else {
-				if loadTime > 20*time.Second {
-					// segment is not loaded
-					{
-						// detect seqNo got reset to 1
-						if d.lastSeqNo > 3 && d.lastSeqNo+4 < curSeq {
-							hasLargerId := false
-							d.SeqMap.Range(func(key, value interface{}) bool {
-								if key.(int) > curSeq {
-									hasLargerId = true
-									return false
-								} else {
-									return true
-								}
-							})
-							if !hasLargerId {
-								d.Logger.Warnf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo)
-								curSeq = getMinNo()
-								continue
-								// exit ASAP so that alt stream will be preserved
-								//d.sendErr(fmt.Errorf("Failed to load segment %d due to segNo got reset to %d", curSeq, d.lastSeqNo))
-								//return
-							} else {
-								// fall into lag check instead
-							}
-						}
-					}
-
-					{
-						// detect if we are lagged (e.g. we are currently at seg2, still waiting for seg3 to appear, however seg4 5 6 7 has already been downloaded)
-						isLagged := false
-						d.SeqMap.Range(func(key, value interface{}) bool {
-							if key.(int) > curSeq+4 && value.(*HLSSegment).Data != nil {
-								d.Logger.Warnf("curSeq %d lags behind segData %d!", curSeq, key.(int))
-								isLagged = true
-								return false
-							} else {
-								return true
-							}
-						})
-						if isLagged { // exit ASAP so that alt stream will be preserved
-							//d.sendErr(fmt.Errorf("Failed to load segment %d within m3u8 timeout due to lag...", curSeq))
-							nextSeq := 2147483647
-							d.SeqMap.Range(func(key, value interface{}) bool {
-								if key.(int) > curSeq && key.(int) < nextSeq {
-									nextSeq = key.(int)
-									return false
-								}
-								return true
-							})
-							d.Logger.Warnf("Failed to load segment %d within m3u8 timeout due to lag, continuing to next seg %d", curSeq, nextSeq)
-							curSeq = nextSeq
-							continue
-						}
+				nextSeq = segChoices[0].SegNo
+				for _, seg := range segChoices {
+					if seg.SegNo == curSeq {
+						nextSeq = curSeq
 					}
 				}
+			}
+			ret := doLoad(nextSeq)
+			if ret == WRITE_FAILED {
+				return
+			} else if ret == LOAD_FINISHED {
+				if nextSeq != curSeq {
+					d.Logger.Warnf("segNo jumped from %d to %d", curSeq, nextSeq)
+				}
+				curSeq = nextSeq
+				d.writeLagNum.Store(0)
+				break
+			} else if ret == DOWNLOAD_WAIT {
+				// simply wait
+			} else if ret == WAIT_SEG {
+				// handled above
 			}
 			time.Sleep(500 * time.Millisecond)
 			loadTime += 500 * time.Millisecond
@@ -1012,20 +1367,30 @@ func (d *HLSDownloader) Writer() {
 			if loadTime == 1*time.Minute || loadTime == 150*time.Second || loadTime == 240*time.Second {
 				//go d.AltSegDownloader() // trigger alt download in advance, so we can avoid more loss
 			}
-			if loadTime > 3*time.Minute { // segNo shouldn't return to 0 within 5 min
+
+			var val *HLSSegment
+			if _val, ok := d.SeqMap.Load(nextSeq); ok {
+				if val, ok = _val.(*HLSSegment); ok {
+
+				}
+			}
+			if d.writeLagNum.Load() > 10 || loadTime > 2*time.Minute || (val != nil && time.Now().Sub(val.SegArriveTime) > 120*time.Second) { // segNo shouldn't return to 0 within 5 min
+				if val != nil {
+					val.SegConCancel()
+				}
 				// if we come to here, then the lag detect would already failed, the live must be interrupted
 				newSeq := 2147483647
 				d.SeqMap.Range(func(key, value interface{}) bool {
 					if key.(int) > curSeq && key.(int) < newSeq {
 						newSeq = key.(int)
-						return false
-					} else {
-						return true
 					}
+					return true
 				})
 				if newSeq != 2147483647 {
 					d.Logger.Warnf("Failed to load segment %d within timeout, continuing to segment %d", curSeq, newSeq)
+					d.writeLagNum.Store(0)
 					curSeq = newSeq
+					loadTime = time.Second * 0
 					continue
 				} else {
 					d.sendErr(fmt.Errorf("Failed to load segment %d within timeout...", curSeq))
@@ -1049,7 +1414,13 @@ func (d *HLSDownloader) startDownload() error {
 	//d.segRl = ratelimit.New(1)
 
 	//d.segRl = rate.NewLimiter(rate.Every(time.Second*5), 1)
-	d.segRl = semaphore.NewWeighted(3)
+	if strings.Contains(d.HLSUrl, "gotcha105") {
+		//d.segRl = semaphore.NewWeighted(1)
+		d.segRl = utils.NewPrioritySem(1)
+	} else {
+		//d.segRl = semaphore.NewWeighted(2)
+		d.segRl = utils.NewPrioritySem(2)
+	}
 
 	d.SegLen = 2.0
 	d.segLens = ring.New(4)
@@ -1170,6 +1541,13 @@ func (d *HLSDownloader) startDownload() error {
 	return err
 }
 
+func initLBData(lbData map[string]string) {
+	advSettings := config.Config.AdvancedSettings
+	for k, v := range advSettings.DomainRewrite {
+		lbData[k] = utils.RandChooseStr(v)
+	}
+}
+
 // initialize the go hls downloader
 func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *interfaces.VideoInfo, m3u8url string, headers map[string]string, needMove bool) error {
 	lbData := make(map[string]string)
@@ -1229,6 +1607,7 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 	}
 
 	d := &HLSDownloader{
+		Context:            context.Background(),
 		Logger:             entry,
 		AltAsMain:          dd.useAlt,
 		HLSUrl:             m3u8url,
@@ -1242,6 +1621,7 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 		Cookie:             dd.cookie,
 		M3U8UrlRewriter:    stealth.GetRewriter(),
 		GeneralUrlRewriter: stealth.GetRewriter(),
+		loadBalanceData:    lbData,
 		//output:    out,
 	}
 

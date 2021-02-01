@@ -41,7 +41,7 @@ func init() {
 	}
 }
 
-var StreamlinkSemaphore = semaphore.NewWeighted(3)
+var StreamlinkSemaphore = semaphore.NewWeighted(4)
 
 func updateInfo(video *interfaces.VideoInfo, proxy string, cookie string, isAlt bool) (needAbort bool, err error, infoJson *simplejson.Json) {
 	needAbort = false
