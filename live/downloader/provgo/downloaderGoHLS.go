@@ -14,7 +14,6 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
-	"github.com/valyala/bytebufferpool"
 	"go.uber.org/atomic"
 	"go.uber.org/ratelimit"
 	"golang.org/x/net/http2"
@@ -99,15 +98,69 @@ type HLSDownloader struct {
 
 	altSegErr sync.Map
 
-	loadBalanceData map[string]string
+	loadBalanceData *LBData
 	useH2           bool
 }
 
-var bufPool bytebufferpool.Pool
-
 var IsStub = false
 
-func (d *HLSDownloader) peekSegment(con context.Context, segData *HLSSegment) bool {
+/*func (d *HLSDownloader) peekSegmentWithWorker(con context.Context, segData *HLSSegment) bool {
+	logger := d.Logger.WithField("alt", false)
+	startTime := time.Now()
+	useMain, useAlt := stealth.GetAltProxyRuleForUrl(segData.Url)
+	clients := d.GetClients(useMain, useAlt, true)
+	client := clients[0]
+	tempCli := utils.CloneHttpClient(client, func(transport *http.Transport) http.RoundTripper {
+		transport.DisableKeepAlives = true
+		return transport
+	})
+}*/
+
+func (d *HLSDownloader) peekSegmentStub(con context.Context, segData *HLSSegment) bool {
+	return true
+}
+
+func (d *HLSDownloader) peekSegmentWithDownload(con context.Context, segData *HLSSegment) bool {
+	logger := d.Logger.WithField("alt", false)
+	startTime := time.Now()
+
+	useMain, useAlt := stealth.GetAltProxyRuleForUrl(segData.Url)
+	clients := d.GetClients(useMain, useAlt, true)
+	client := clients[0]
+	tempCli := utils.CloneHttpClient(client, func(transport *http.Transport) http.RoundTripper {
+		transport.DisableKeepAlives = true
+		transport.ResponseHeaderTimeout = 50 * time.Second
+		return transport
+	})
+
+	var res *http.Response
+	doReq := func() (*http.Response, error) {
+		req, err := utils.HttpBuildRequest(con, "GET", segData.Url, d.HLSHeader, nil)
+		if req == nil {
+			return nil, err
+		}
+		//req.Close = true
+		res, err = utils.HttpDoRequest(con, tempCli, req)
+		if res == nil {
+			return nil, err
+		}
+		tempbuf := make([]byte, 4)
+		_, _ = res.Body.Read(tempbuf)
+		_ = res.Body.Close()
+		return res, nil
+	}
+	res, err := doReq()
+	if res != nil {
+		logger.Debugf("Successfully peeked segment %d in %v", segData.SegNo, time.Now().Sub(startTime))
+		return true
+	} else {
+		logger.Debugf("Failed to peek segment %d in %v, rets: %v", segData.SegNo, time.Now().Sub(startTime), err)
+		return false
+	}
+	//logger.Tracef("Downloading segment %d (%s) useMain %d useAlt %d", segData.SegNo, segData.Url, useMain, useAlt)
+}
+
+func (d *HLSDownloader) peekSegmentWithRange(con context.Context, segData *HLSSegment) bool {
 	logger := d.Logger.WithField("alt", false)
 	startTime := time.Now()
 	// prepare the client
@@ -359,6 +412,7 @@ func (d *HLSDownloader) downloadSegment(segData *HLSSegment) bool {
 			close(ch)
 		}
 	}()
+	var segBuffer *bytes.Buffer
 breakout:
 	for {
 		i %= len(clients)
@@ -380,13 +434,13 @@ breakout:
 				tch := time.After(time.Second * 60)
 				time.Sleep(6 * time.Second)
 
-			breakout:
+			breakout1:
 				for {
 					select {
 					case <-tch:
 						if downloadCount.Load() <= 1 {
 							ch <- 1
-							break breakout
+							break breakout1
 						}
 					default:
 					}
@@ -416,6 +470,7 @@ breakout:
 				return false
 			}
 			segData.Data = ret
+			segBuffer = ret
 			break breakout
 		case <-retryChan:
 			// wait 10 second for each download try
@@ -439,7 +494,7 @@ breakout:
 		// log the too long seg download and alt seg download
 		dolog = logger.Infof
 	}
-	dolog("Downloaded segment %d: len %v client %d using %v (wait %v)", segData.SegNo, segData.Data.Len(), i, time.Now().Sub(beginTime), beginTime.Sub(startTime))
+	dolog("Downloaded segment %d: len %v client %d using %v (wait %v)", segData.SegNo, segBuffer.Len(), i, time.Now().Sub(beginTime), beginTime.Sub(startTime))
 	finished = true
 	d.writeLagNum.Inc()
 	return true
@@ -455,36 +510,26 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 
 	//logger := d.Logger.WithField("alt", false)
 
-	if strings.Contains(segData.Url, "gotcha105") {
-		PEEK_TIME := SEG_DOWNLOAD_START_DDL - 30*time.Second
-		PEEK_NUMBER := 1
-		con, concancel := context.WithTimeout(segData.SegContext, PEEK_TIME)
-		//peekChan := make(chan int)
-		for i := 0; i < PEEK_NUMBER; i++ {
-			// peek it first!
-			/*func() {
-				if doDownload(con, clients[0], true) {
-					peekChan <- 1
-				}
-			}()*/
-			peekStart := time.Now()
-			if d.peekSegment(con, segData) {
-				concancel()
-				break
-			}
-			time.Sleep(PEEK_TIME/time.Duration(PEEK_NUMBER) - time.Now().Sub(peekStart))
+	PEEK_TIME := SEG_DOWNLOAD_START_DDL - 30*time.Second
+	PEEK_NUMBER := 1
+	con, concancel := context.WithTimeout(segData.SegContext, PEEK_TIME)
+	for i := 0; i < PEEK_NUMBER; i++ {
+		peekStart := time.Now()
+		peeker := d.peekSegmentStub
+		if strings.Contains(segData.Url, "gotcha105") {
+			peeker = d.peekSegmentWithRange
+		} else if strings.Contains(segData.Url, "gotcha104") {
+			peeker = d.peekSegmentWithDownload
 		}
-		<-con.Done()
-		time.Sleep(10 * time.Second)
-		//time.Sleep(PEEK_TIME / time.Duration(PEEK_NUMBER))
-		/*
-			select {
-			case <-con.Done():
-				;
-			case <-peekChan:
-				concancel()
-			}*/
+		if peeker(con, segData) {
+			concancel()
+			break
+		}
+		time.Sleep(PEEK_TIME/time.Duration(PEEK_NUMBER) - time.Now().Sub(peekStart))
 	}
+	<-con.Done()
+	time.Sleep(6 * time.Second)
+
 	return d.downloadSegment(segData)
 }
 
@@ -854,7 +899,7 @@ func (d *HLSDownloader) refreshClient() {
 	for _, cli := range d.h2Clients {
 		cli.CloseIdleConnections()
 	}
-	initLBData(d.loadBalanceData)
+	d.initLBData()
 }
 
 // query main m3u8 every 2 seconds
@@ -1291,7 +1336,7 @@ func (d *HLSDownloader) Writer() {
 				if curSeq >= 60 {
 					d.SeqMap.Range(func(key, value interface{}) bool {
 						// delete old entry, but preserve reseted seg & recently segs (so that seg won't be reload)
-						if key.(int) <= curSeq-20 && value.(*HLSSegment).SegArriveTime.Before(time.Now().Add(-time.Second*180)) {
+						if /*key.(int) <= curSeq-20 && */ value.(*HLSSegment).SegArriveTime.Before(time.Now().Add(-time.Second * 240)) {
 							d.SeqMap.Delete(key.(int))
 						}
 						return true
@@ -1410,6 +1455,7 @@ func (d *HLSDownloader) startDownload() error {
 	var err error
 
 	d.FinishSeq = -1
+	d.initLBData()
 	// rate limit, so we won't break up all things
 	//d.segRl = ratelimit.New(1)
 
@@ -1419,7 +1465,7 @@ func (d *HLSDownloader) startDownload() error {
 		d.segRl = utils.NewPrioritySem(1)
 	} else {
 		//d.segRl = semaphore.NewWeighted(2)
-		d.segRl = utils.NewPrioritySem(2)
+		d.segRl = utils.NewPrioritySem(5)
 	}
 
 	d.SegLen = 2.0
@@ -1429,7 +1475,7 @@ func (d *HLSDownloader) startDownload() error {
 	d.output = writer
 	defer writer.Close()
 
-	d.useH2 = false
+	//d.useH2 = false
 	/*if strings.Contains(d.HLSUrl, "gotcha105") {
 		d.useH2 = true
 	}*/
@@ -1541,21 +1587,25 @@ func (d *HLSDownloader) startDownload() error {
 	return err
 }
 
-func initLBData(lbData map[string]string) {
+type LBData struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func (d *HLSDownloader) initLBData() {
+	lbData := d.loadBalanceData
+	lbData.mu.Lock()
+	defer lbData.mu.Unlock()
 	advSettings := config.Config.AdvancedSettings
 	for k, v := range advSettings.DomainRewrite {
-		lbData[k] = utils.RandChooseStr(v)
+		lbData.data[k] = utils.RandChooseStr(v)
 	}
+	d.Logger.Infof("Initiated loadBalanceData: %v", lbData.data)
 }
 
 // initialize the go hls downloader
 func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *interfaces.VideoInfo, m3u8url string, headers map[string]string, needMove bool) error {
-	lbData := make(map[string]string)
-	advSettings := config.Config.AdvancedSettings
-	for k, v := range advSettings.DomainRewrite {
-		lbData[k] = utils.RandChooseStr(v)
-	}
-	entry.Infof("Initiated loadBalanceData: %v", lbData)
+	lbData := &LBData{data: make(map[string]string)}
 
 	clients := []*http.Client{
 		{
@@ -1568,10 +1618,12 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 				DisableKeepAlives:     false,
 				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 				DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+					lbData.mu.RLock()
 					_addr := addr
-					if domain, ok := lbData[addr]; ok {
+					if domain, ok := lbData.data[addr]; ok {
 						addr = domain
 					}
+					lbData.mu.RUnlock()
 					if logger := ctx.Value("logger"); logger != nil {
 						logger.(*log.Entry).WithError(err).Tracef("Connecting %s %s with %s", network, _addr, addr)
 					}
@@ -1624,7 +1676,6 @@ func (dd *DownloaderGo) doDownloadHls(entry *log.Entry, output string, video *in
 		loadBalanceData:    lbData,
 		//output:    out,
 	}
-
 	err := d.startDownload()
 	time.Sleep(1 * time.Second)
 	utils.ExecShell("/home/misty/rclone", "rc", "vfs/forget", "dir="+path.Dir(output))

@@ -59,14 +59,20 @@ type AltProxyRuleEntry struct {
 	Alt     int
 }
 
+type PeekRuleEntry struct {
+	Match string
+	Rule  string
+}
+
 type AdvancedSettings struct {
 	LoadBalance            []string
 	LoadBalanceBlacklist   []string
 	DomainRewrite          map[string]([]string)
 	M3U8Rewrite            map[string]string
-	GeneralRewrite         map[string]string
+	SegRewrite             map[string]string
 	AltProxyRule           []AltProxyRuleEntry
 	AltDownloaderBlacklist []string
+	PeekSettings           []PeekRuleEntry
 }
 
 var v *viper.Viper

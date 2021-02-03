@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"io"
 	"os"
+	"time"
 
 	"strings"
 )
@@ -84,6 +85,7 @@ func updateInfo(video *interfaces.VideoInfo, proxy string, cookie string, isAlt 
 		defer func() {
 			if err != nil {
 				logger.Infof("Streamlink err output: %s", stderr)
+				err = fmt.Errorf("%s, stderr: %s", err.Error(), stderr)
 			}
 		}()
 		if strings.Contains(stderr, "(abort)") {
@@ -143,11 +145,18 @@ func (d *DownloaderGo) StartDownload(video *interfaces.VideoInfo, proxy string, 
 	var streamtype string
 	var needAbort bool
 	for i := 0; i < 6; i++ {
-		if i < 3 {
-			needAbort, err, infoJson = updateInfo(video, proxy, cookie, false)
-		} else {
+		if i >= 3 {
 			d.useAlt = true
-			needAbort, err, infoJson = updateInfo(video, proxy, cookie, true)
+		}
+		needAbort, err, infoJson = updateInfo(video, proxy, cookie, d.useAlt)
+		if err != nil {
+			if strings.Contains(err.Error(), "timed out") || strings.Contains(err.Error(), "timeout") {
+				i-- // retry
+			}
+			if strings.Contains(err.Error(), "gotcha105") && strings.Contains(err.Error(), "404") {
+				// temporarily 404
+				i-- // retry
+			}
 		}
 		if needAbort {
 			// if we didn't entered live
@@ -199,6 +208,7 @@ func (d *DownloaderGo) StartDownload(video *interfaces.VideoInfo, proxy string, 
 				panic("forceabort")
 			}
 		}
+		time.Sleep(5 * time.Second)
 	}
 	return err
 }
