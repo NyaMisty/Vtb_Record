@@ -6,13 +6,26 @@ on:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    #defaults:
+    #  run:
+    #    working-directory: ./NyaMisty/Vtb_Record
     steps:
       -
         name: Checkout
         uses: actions/checkout@v2
+        with:
+          path: ./NyaMisty/Vtb_Record
+      -
+        name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: NyaMisty/rclone
+          ref: vtbrec
+          path: ./rclone/rclone
       -
         name: Unshallow
         run: git fetch --prune --unshallow
+        working-directory: ./NyaMisty/Vtb_Record
       -
         name: Set up Go
         uses: actions/setup-go@v1
@@ -20,10 +33,17 @@ jobs:
           go-version: 1.13.x
       -
         name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v1
+        uses: goreleaser/goreleaser-action@v2
         with:
           version: latest
           args: release --rm-dist
-          key: ${{ secrets.YOUR_PRIVATE_KEY }}
+          workdir: ./NyaMisty/Vtb_Record
+          #install-only: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Upload assets
+        uses: actions/upload-artifact@v2
+        with:
+          name: Vtb_Record
+          path: ./NyaMisty/Vtb_Record/dist/*

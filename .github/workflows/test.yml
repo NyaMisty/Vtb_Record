@@ -19,6 +19,14 @@ jobs:
           go-version: ${{ matrix.go-version }}
       - name: Checkout code
         uses: actions/checkout@v2
+        with:
+          path: ./NyaMisty/Vtb_Record
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: NyaMisty/rclone
+          ref: vtbrec
+          path: ./rclone/rclone
       - name: Test
         shell: bash
         env:
@@ -26,3 +34,4 @@ jobs:
         run: |
           curl -O -H "Authorization: $DATASTORE_AUTH" "http://vtbrecorder.misty.moe:22334/config_test.json"
           go test ./... -config `pwd`/config_test.json -vet=off
+        working-directory: ./NyaMisty/Vtb_Record
