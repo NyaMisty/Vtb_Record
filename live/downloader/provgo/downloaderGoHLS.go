@@ -231,7 +231,7 @@ func (d *HLSDownloader) peekSegmentWithRange(con context.Context, segData *HLSSe
 			rets = append(rets, fmt.Sprintf("'err:%v'", err))
 		}
 
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Second * 3)
 		if round > 8 {
 			logger.Warnf("Failed to peek segment %d within timeout: %s, rets: %v", segData.SegNo, segData.Url, rets)
 			return false
@@ -528,7 +528,7 @@ func (d *HLSDownloader) handleSegment(segData *HLSSegment) bool {
 		time.Sleep(PEEK_TIME/time.Duration(PEEK_NUMBER) - time.Now().Sub(peekStart))
 	}
 	<-con.Done()
-	time.Sleep(6 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	return d.downloadSegment(segData)
 }
@@ -1475,10 +1475,10 @@ func (d *HLSDownloader) startDownload() error {
 	d.output = writer
 	defer writer.Close()
 
-	//d.useH2 = false
-	/*if strings.Contains(d.HLSUrl, "gotcha105") {
+	d.useH2 = false
+	if strings.Contains(d.HLSUrl, "gotcha105") {
 		d.useH2 = true
-	}*/
+	}
 
 	d.allClients = make([]*http.Client, 0)
 	d.allClients = append(d.allClients, d.Clients...)

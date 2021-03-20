@@ -241,6 +241,10 @@ func (y *YoutubePoller) getLiveStatus() error {
 	re, _ := regexp.Compile("SAPISID=(.*?);")
 	ret := re.FindStringSubmatch(cookie)
 	if len(ret) < 2 {
+		re, _ = regexp.Compile("__Secure-3PAPISID=(.*?);")
+		ret = re.FindStringSubmatch(cookie)
+	}
+	if len(ret) < 2 {
 		return fmt.Errorf("Youtube SAPISID not present in cookie!")
 	}
 	SAPISID := ret[1]

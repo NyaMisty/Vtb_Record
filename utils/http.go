@@ -358,7 +358,7 @@ func HttpMultiDownload(ctx context.Context, client *http.Client, meth, url strin
 	var wg sync.WaitGroup
 	var retErr error = nil
 
-	var errs []error
+	errs := make([]error, 0)
 	var downloadChunk func(min int64, max int64, i string)
 	downloadChunk = func(min int64, max int64, i string) {
 		defer wg.Done()
